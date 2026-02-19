@@ -6,3 +6,13 @@ distribution = "2201.13.1"
 
 [build-options]
 observabilityIncluded = true
+
+[[dependency]]
+org = "ballerina"
+name = "uuid"
+version = "1.10.0"
+
+[[dependency]]
+org = "ballerina"
+name = "file"
+version = "1.12.0"

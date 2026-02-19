@@ -1,0 +1,197 @@
+:root {
+  --primary: #E0C3FC;
+  --secondary: #8EC5FC;
+  --bg-dark: #0a0a0c;
+  --glass: rgba(255, 255, 255, 0.05);
+  --glass-border: rgba(255, 255, 255, 0.1);
+}
+
+body {
+  background-color: var(--bg-dark);
+  color: white;
+  margin: 0;
+  overflow: hidden;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.app-container {
+  height: 100vh;
+  width: 100vw;
+  display: flex;
+  flex-direction: column;
+  background: radial-gradient(circle at 50% 50%, #1a1a2e 0%, #0a0a0c 100%);
+}
+
+.app-header {
+  padding: 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.logo-section h1 {
+  font-size: 2.5rem;
+  margin: 0;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: 800;
+  letter-spacing: -1px;
+}
+
+.subtitle {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 4px;
+  opacity: 0.6;
+  margin-left: 2px;
+}
+
+.status-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(10px);
+}
+
+.status-badge.connected {
+  color: #4ade80;
+  box-shadow: 0 0 10px rgba(74, 222, 128, 0.2);
+}
+
+.status-badge.disconnected {
+  color: #f87171;
+}
+
+.assistant-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4rem;
+}
+
+.visualizer-container {
+  position: relative;
+  width: 300px;
+  height: 300px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.orb-container {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  position: relative;
+  z-index: 2;
+  transition: transform 0.1s ease-out;
+}
+
+.orb-inner {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  position: relative;
+  z-index: 2;
+  filter: blur(2px);
+}
+
+.orb-glow {
+  position: absolute;
+  top: -20px;
+  left: -20px;
+  right: -20px;
+  bottom: -20px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--secondary) 0%, transparent 70%);
+  opacity: 0.4;
+  z-index: 1;
+}
+
+.processing-ring {
+  position: absolute;
+  width: 200px;
+  height: 200px;
+  border: 2px solid var(--primary);
+  border-radius: 50%;
+  z-index: 0;
+}
+
+.particle {
+  position: absolute;
+  width: 140px;
+  height: 140px;
+  border: 1px solid rgba(142, 197, 252, 0.2);
+  border-radius: 40% 60% 70% 30% / 40% 50% 60% 50%;
+  top: -10px;
+  left: -10px;
+}
+
+.controls-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.transcript-hint {
+  height: 24px;
+  font-size: 0.9rem;
+  opacity: 0.7;
+}
+
+.mic-button {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  border: none;
+  background: white;
+  color: var(--bg-dark);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 10px 20px rgba(0,0,0,0.3);
+  transition: background 0.3s;
+}
+
+.mic-button.active {
+  background: #f87171;
+  color: white;
+  box-shadow: 0 0 20px rgba(248, 113, 113, 0.4);
+}
+
+.processing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--secondary);
+}
+
+.spin {
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.app-footer {
+  padding: 2rem;
+  text-align: center;
+  font-size: 0.7rem;
+  opacity: 0.4;
+  letter-spacing: 1px;
+}

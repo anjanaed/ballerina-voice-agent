@@ -1,6 +1,6 @@
-import { useCallback, useMemo, useRef, useEffect } from 'react';
+import { useCallback, useMemo, useRef, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Mic, MicOff, Radio } from 'lucide-react';
+import { Mic, MicOff, Radio, ChevronDown, Loader2 } from 'lucide-react';
 import { useAudio } from './hooks/useAudio';
 import { useWebSocket } from './hooks/useWebSocket';
 import type { Message } from './hooks/useWebSocket';
@@ -9,8 +9,10 @@ import './App.css';
 const WAVE_DURATIONS = Array.from({ length: 12 }, () => 0.5 + Math.random() * 0.55);
 
 function App() {
-  const { isConnected, isProcessing, isSpeaking, messages, sendMessage } =
-    useWebSocket('ws://localhost:8001/ws');
+  const [selectedPort, setSelectedPort] = useState('8002');
+
+  const { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage } =
+    useWebSocket(`ws://localhost:${selectedPort}/ws`);
 
   const handleSilence = useCallback(
     (data: ArrayBuffer) => { sendMessage(data); },
@@ -43,6 +45,26 @@ function App() {
     conversationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const ports = [
+    { id: '8001', label: 'OpenAI'},
+    { id: '8002', label: 'Open Source'},
+  ];
+
+  const currentPort = ports.find(p => p.id === selectedPort) || ports[1];
+
   return (
     <div className="app-container">
       <header className="app-header">
@@ -50,9 +72,57 @@ function App() {
           <h1>Ballerina</h1>
           <span className="subtitle">Voice Assistant</span>
         </motion.div>
-        <div className={`status-badge ${isConnected ? 'connected' : 'disconnected'}`}>
-          <Radio size={14} />
-          {isConnected ? 'LIVE' : 'OFFLINE'}
+        
+        <div className="header-controls">
+          <div className="custom-dropdown" ref={dropdownRef}>
+            <motion.button
+              whileHover={!isConnecting ? { backgroundColor: 'rgba(255,255,255,0.1)' } : {}}
+              whileTap={!isConnecting ? { scale: 0.98 } : {}}
+              onClick={() => !isConnecting && setIsDropdownOpen(!isDropdownOpen)}
+              className={`dropdown-trigger ${isConnecting ? 'connecting' : ''} ${isDropdownOpen ? 'active' : ''}`}
+            >
+              {isConnecting ? (
+                <Loader2 size={16} className="spinning-loader" />
+              ) : (
+                <span className="port-icon">{currentPort.icon}</span>
+              )}
+              <span className="selected-label">{isConnecting ? 'Connecting…' : currentPort.label}</span>
+              <ChevronDown size={14} className={`chevron ${isDropdownOpen ? 'rotate' : ''}`} />
+            </motion.button>
+
+            <AnimatePresence>
+              {isDropdownOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                  transition={{ duration: 0.2, ease: [0.23, 1, 0.32, 1] }}
+                  className="dropdown-menu"
+                >
+                  {ports.map((port) => (
+                    <motion.button
+                      key={port.id}
+                      whileHover={{ backgroundColor: 'rgba(255,255,255,0.08)', x: 4 }}
+                      onClick={() => {
+                        setSelectedPort(port.id);
+                        setIsDropdownOpen(false);
+                      }}
+                      className={`dropdown-item ${selectedPort === port.id ? 'selected' : ''}`}
+                    >
+                      <span className="item-icon">{port.icon}</span>
+                      <span className="item-label">{port.label}</span>
+                      {selectedPort === port.id && <motion.div layoutId="active-indicator" className="active-dot" />}
+                    </motion.button>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <div className={`status-badge ${isConnected ? 'connected' : 'disconnected'}`}>
+            <Radio size={14} />
+            {isConnected ? 'LIVE' : 'OFFLINE'}
+          </div>
         </div>
       </header>
 
@@ -104,7 +174,7 @@ function App() {
           <div ref={conversationEndRef} />
         </div>
 
-        {/* Visualizer orb and rings */}
+        {/* Background Visualizer orb */}
         <div className="visualizer-container">
           <AnimatePresence>
             {(isRecording || isSpeaking) && [0, 1, 2].map((i) => (
@@ -137,46 +207,54 @@ function App() {
           </motion.div>
         </div>
 
-        {/* Wave bars shown while speaking */}
-        <AnimatePresence>
-          {isSpeaking && (
-            <motion.div className="wave-bars" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 12 }} transition={{ duration: 0.22 }}>
-              {WAVE_DURATIONS.map((dur, i) => (
-                <motion.div key={i} className="wave-bar" animate={{ scaleY: [0.2, 1, 0.2] }} transition={{ duration: dur, repeat: Infinity, delay: i * 0.055, ease: 'easeInOut' }} />
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* Controls and status displays */}
-        <div className="controls-section">
-          <div className="status-hint">
-            <AnimatePresence mode="wait">
-              <motion.p key={statusLabel} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: 0.16 }} className={`mode-label mode-${mode}`}>
-                {statusLabel}
-              </motion.p>
-            </AnimatePresence>
+        {/* COMPACT HORIZONTAL FOOTER */}
+        <div className="footer-controls">
+          <div className="status-section">
+            {(isRecording || isSpeaking) && (
+              <div className="inline-waves">
+                {WAVE_DURATIONS.slice(0, 6).map((dur, i) => (
+                  <motion.div
+                    key={i}
+                    className={`wave-bar-tiny ${mode}`}
+                    animate={{ height: [8, 24, 8] }}
+                    transition={{ duration: dur, repeat: Infinity, delay: i * 0.1 }}
+                  />
+                ))}
+              </div>
+            )}
+            <div className="status-hint">
+              <AnimatePresence mode="wait">
+                <motion.p 
+                  key={statusLabel} 
+                  initial={{ opacity: 0, x: -10 }} 
+                  animate={{ opacity: 1, x: 0 }} 
+                  exit={{ opacity: 0, x: 10 }} 
+                  className={`mode-label mode-${mode}`}
+                >
+                  {statusLabel}
+                </motion.p>
+              </AnimatePresence>
+            </div>
           </div>
 
           <motion.button
-            whileHover={!isProcessing && !isSpeaking ? { scale: 1.07 } : {}}
-            whileTap={!isProcessing && !isSpeaking ? { scale: 0.93 } : {}}
+            whileHover={!isProcessing && !isSpeaking ? { scale: 1.05 } : {}}
+            whileTap={!isProcessing && !isSpeaking ? { scale: 0.95 } : {}}
             onClick={toggleRecording}
             disabled={isProcessing || isSpeaking}
             className={`mic-button ${isRecording ? 'active' : ''} ${isProcessing || isSpeaking ? 'disabled' : ''}`}
-            aria-label={isRecording ? 'Stop recording' : 'Start recording'}
           >
-            {isRecording ? <Mic size={32} /> : <MicOff size={32} />}
+            {isRecording ? <Mic size={24} /> : <MicOff size={24} />}
           </motion.button>
-
-          <AnimatePresence>
-            {!isConnected && (
-              <motion.p className="offline-warning" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                Reconnecting to server…
-              </motion.p>
-            )}
-          </AnimatePresence>
         </div>
+
+        <AnimatePresence>
+          {!isConnected && (
+            <div className="offline-warning">
+              Reconnecting to server…
+            </div>
+          )}
+        </AnimatePresence>
       </main>
 
       <footer className="app-footer">

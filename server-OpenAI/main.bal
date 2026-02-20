@@ -28,9 +28,13 @@ isolated service class WsService {
     # Capped at MAX_HISTORY_PAIRS * 2 entries so the LLM prompt stays bounded.
     private [string, string][] history = [];
 
-    # Handles an incoming binary audio message from the browser client.
-    # Never returns websocket:Error — all errors handled locally so the
-    # connection is never closed by a pipeline failure or failed write.
+    /// Handles an incoming binary audio message from the browser client.
+    ///
+    /// Never returns websocket:Error — all errors handled locally so the
+    /// connection is never closed by a pipeline failure or failed write.
+    ///
+    /// @param caller The WebSocket caller instance for this connection.
+    /// @param data The binary audio data received from the client.
     remote isolated function onMessage(websocket:Caller caller, byte[] data) {
 
         // Speech-to-Text (STT) Processing
@@ -127,7 +131,10 @@ isolated service class WsService {
     }
 }
 
-# Sends a plain-text WebSocket frame. Errors are logged, never propagated.
+/// Sends a plain-text WebSocket frame. Errors are logged, never propagated.
+///
+/// @param caller The WebSocket caller instance for this connection.
+/// @param msg The message string to send to the client.
 isolated function sendText(websocket:Caller caller, string msg) {
     websocket:Error? err = caller->writeMessage(msg);
     if err is websocket:Error {
@@ -135,6 +142,10 @@ isolated function sendText(websocket:Caller caller, string msg) {
     }
 }
 
+/// Converts speech audio in a file to text using OpenAI Whisper.
+///
+/// @param fileName The path to the audio file to transcribe.
+/// @return The transcribed text, or an error if transcription fails.
 isolated function SpeechToText(string fileName) returns string|error {
     byte[] fileContent = check io:fileReadBytes(fileName);
     audio:CreateTranscriptionRequest request = {
@@ -145,14 +156,21 @@ isolated function SpeechToText(string fileName) returns string|error {
     return response.text;
 }
 
-# Accepts a fully-formed prompt string (including history context) and
-# calls the LLM. Wrapping in a backtick template satisfies the ai:Prompt type
-# that model->generate() requires — plain strings are not accepted directly.
+/// Accepts a fully-formed prompt string (including history context) and
+/// calls the LLM. Wrapping in a backtick template satisfies the ai:Prompt type
+/// that model->generate() requires — plain strings are not accepted directly.
+///
+/// @param prompt The prompt string to send to the LLM.
+/// @return The generated response from the LLM, or an error if the call fails.
 isolated function llmCall(string prompt) returns string|error {
     string response = check model->generate(`${prompt}`);
     return response;
 }
 
+/// Converts text to speech audio using OpenAI TTS.
+///
+/// @param text The text to convert to speech.
+/// @return The generated audio as a byte array, or an error if TTS fails.
 isolated function textToSpeech(string text) returns byte[]|error {
     audio:CreateSpeechRequest request = {
         model: "tts-1",
@@ -163,6 +181,9 @@ isolated function textToSpeech(string text) returns byte[]|error {
     return audioBytes;
 }
 
+/// Entry point for the WebSocket server application.
+///
+/// @return error? An error if server startup fails, else nil.
 public function main() returns error? {
     io:println("WebSocket server listening on ws://localhost:8001/ws");
 }

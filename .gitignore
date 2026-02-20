@@ -1,0 +1,32 @@
+# Ignore Python virtual environments
+models/**/env*/
+models/**/venv*/
+models/**/Lib/
+models/**/Scripts/
+models/**/__pycache__/
+
+# Ignore large model/data files
+models/**/*.pth
+models/**/*.pt
+models/**/*.h5
+models/**/*.ckpt
+models/**/*.onnx
+models/**/*.npz
+models/**/*.npy
+models/**/*.pkl
+models/**/*.joblib
+models/**/*.tar
+models/**/*.zip
+models/**/*.gz
+models/**/*.wav
+models/**/*.mp3
+models/**/*.flac
+models/**/*.bin
+models/**/*.tflite
+models/**/*.pb
+
+# Do NOT ignore Python scripts or documentation
+!models/**/*.py
+!models/**/*.md
+!models/**/*.txt
+!models/**/*.ipynb

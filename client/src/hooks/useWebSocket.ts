@@ -7,6 +7,7 @@ export type Message = {
 
 export function useWebSocket(url: string) {
   const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);  // Full conversation history
@@ -22,6 +23,7 @@ export function useWebSocket(url: string) {
     const connect = () => {
       if (!isMounted) return;
 
+      setIsConnecting(true);
       socket = new WebSocket(url);
       socket.binaryType = 'arraybuffer';
       socketRef.current = socket;
@@ -29,6 +31,7 @@ export function useWebSocket(url: string) {
       socket.onopen = () => {
         if (isMounted) {
           setIsConnected(true);
+          setIsConnecting(false);
           console.log('WebSocket connected');
         }
       };
@@ -37,6 +40,7 @@ export function useWebSocket(url: string) {
         if (!isMounted) return;
         console.log('WebSocket closed, code:', ev.code, 'reason:', ev.reason);
         setIsConnected(false);
+        setIsConnecting(false);
         setIsProcessing(false);
         setIsSpeaking(false);
         socketRef.current = null;
@@ -46,6 +50,7 @@ export function useWebSocket(url: string) {
       socket.onerror = (ev) => {
         console.error('WebSocket error:', ev);
         if (isMounted) {
+          setIsConnecting(false);
           setIsProcessing(false);
           setIsSpeaking(false);
         }
@@ -145,5 +150,5 @@ export function useWebSocket(url: string) {
     return false;
   }, []);
 
-  return { isConnected, isProcessing, isSpeaking, messages, sendMessage };
+  return { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage };
 }

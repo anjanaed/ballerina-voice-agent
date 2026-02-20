@@ -1,0 +1,8 @@
+[package]
+org = "anjana_ed"
+name = "voice_agent_local"
+version = "0.1.0"
+distribution = "2201.13.1"
+
+[build-options]
+observabilityIncluded = true

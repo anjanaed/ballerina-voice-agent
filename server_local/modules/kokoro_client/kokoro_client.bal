@@ -1,7 +1,8 @@
 import ballerina/http;
-final http:Client kokoroClient = check new("http://localhost:8005");
 
-isolated function ttsWithKokoro(string text) returns byte[]|error {
+final http:Client kokoroClient = check new ("http://localhost:8005");
+
+public isolated function ttsWithKokoro(string text) returns byte[]|error {
     json requestBody = {
         text: text
     };

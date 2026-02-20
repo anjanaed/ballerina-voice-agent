@@ -1,6 +1,6 @@
 [package]
 org = "anjana_ed"
-name = "voice_agent_local"
+name = "server_local"
 version = "0.1.0"
 distribution = "2201.13.1"
 

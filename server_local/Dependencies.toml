@@ -9,22 +9,21 @@ distribution-version = "2201.13.1"
 
 [[package]]
 org = "anjana_ed"
-name = "voice_agent_local"
+name = "server_local"
 version = "0.1.0"
 dependencies = [
 	{org = "ballerina", name = "ai"},
 	{org = "ballerina", name = "http"},
 	{org = "ballerina", name = "io"},
-	{org = "ballerina", name = "test"},
 	{org = "ballerina", name = "uuid"},
 	{org = "ballerina", name = "websocket"},
 	{org = "ballerinai", name = "observe"},
 	{org = "ballerinax", name = "ai.openai"}
 ]
 modules = [
-	{org = "anjana_ed", packageName = "voice_agent_local", moduleName = "voice_agent_local"},
-	{org = "anjana_ed", packageName = "voice_agent_local", moduleName = "voice_agent_local.kokoro_client"},
-	{org = "anjana_ed", packageName = "voice_agent_local", moduleName = "voice_agent_local.whisper_client"}
+	{org = "anjana_ed", packageName = "server_local", moduleName = "server_local"},
+	{org = "anjana_ed", packageName = "server_local", moduleName = "server_local.kokoro_client"},
+	{org = "anjana_ed", packageName = "server_local", moduleName = "server_local.whisper_client"}
 ]
 
 [[package]]
@@ -220,15 +219,6 @@ dependencies = [
 
 [[package]]
 org = "ballerina"
-name = "lang.error"
-version = "0.0.0"
-scope = "testOnly"
-dependencies = [
-	{org = "ballerina", name = "jballerina.java"}
-]
-
-[[package]]
-org = "ballerina"
 name = "lang.int"
 version = "0.0.0"
 dependencies = [
@@ -350,20 +340,6 @@ dependencies = [
 	{org = "ballerina", name = "jballerina.java"},
 	{org = "ballerina", name = "time"},
 	{org = "ballerina", name = "uuid"}
-]
-
-[[package]]
-org = "ballerina"
-name = "test"
-version = "0.0.0"
-scope = "testOnly"
-dependencies = [
-	{org = "ballerina", name = "jballerina.java"},
-	{org = "ballerina", name = "lang.array"},
-	{org = "ballerina", name = "lang.error"}
-]
-modules = [
-	{org = "ballerina", packageName = "test", moduleName = "test"}
 ]
 
 [[package]]

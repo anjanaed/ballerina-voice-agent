@@ -1,13 +1,17 @@
-import ballerina/io;
 import ballerina/ai;
-import ballerina/websocket;
 import ballerina/http;
+import ballerina/io;
 import ballerina/uuid;
+import ballerina/websocket;
 import ballerinax/ai.openai;
 
+import server_local.kokoro_client;
+import server_local.whisper_client;
 
+# The OpenAI token for accessing the GPT model.
 configurable string openaiToken = ?;
 
+# The AI model provider instance, initialized with the GPT-4O model.
 final ai:ModelProvider model = check new openai:ModelProvider(openaiToken, openai:GPT_4O);
 
 final ai:Agent voiceAgent = check new ({
@@ -18,73 +22,63 @@ final ai:Agent voiceAgent = check new ({
     model: check new openai:ModelProvider(openaiToken, openai:GPT_4O)
 });
 
+# The WebSocket service listener.
 service /ws on new websocket:Listener(8002) {
+
+    # Upgrades the HTTP request to a WebSocket connection.
+    #
+    # + req - The HTTP request
+    # + return - The WebSocket service or an upgrade error
     resource function get .(http:Request req) returns websocket:Service|websocket:UpgradeError {
         return new WsService();
     }
 }
 
+# Represents the WebSocket service for the local voice agent.
 isolated service class WsService {
     *websocket:Service;
+
+    # The unique session ID for the connection.
     private final string sessionId = uuid:createRandomUuid();
 
-    # Per-connection conversation history: [[role, content], ...]
-    # No cap — running fully local so memory is not a concern.
+    # Triggered when a binary message (audio) is received from the client.
+    # Performs speech-to-text, queries the local voice agent, and returns text-to-speech audio.
+    # Per-connection conversation history is maintained implicitly by the session context.
+    #
+    # + caller - The WebSocket caller
+    # + data - The audio data received as a byte array
+    remote isolated function onBinaryMessage(websocket:Caller caller, byte[] data) {
 
-    remote isolated function onMessage(websocket:Caller caller, byte[] data) {
-
-        // Speech-to-Text
-        // string requestId = uuid:createRandomUuid();
-        // string tempDir = os:getEnv("TEMP");
-        // string requestFile = string `${tempDir}\\request_${requestId}.wav`;
-
-        // error? writeErr = io:fileWriteBytes(requestFile, data);
-        // if writeErr is error {
-        //     io:println("Failed to write WAV: ", writeErr.message());
-        //     sendText(caller, "ERROR: could not save audio");
-        //     return;
-        // }
-
-        string|error transcriptResult = transcribeWithLocalWhisper(data);
-
-        // file:Error? removeErr = file:remove(requestFile);
-        // if removeErr is file:Error {
-        //     io:println("Warning: could not remove '", requestFile, "': ", removeErr.message());
-        // }
+        string|error transcriptResult = whisper_client:transcribeWithLocalWhisper(data);
 
         if transcriptResult is error {
             io:println("STT error: ", transcriptResult.message());
-            sendText(caller, "ERROR: transcription failed — " + transcriptResult.message());
+            sendText(caller, string `ERROR: transcription failed — ${transcriptResult.message()}`);
             return;
         }
 
         string transcript = transcriptResult;
         io:println("[STT] ", transcript);
 
-        // Send transcript to frontend immediately
-        sendText(caller, "TRANSCRIPT:" + transcript);
+        sendText(caller, string `TRANSCRIPT:${transcript}`);
 
-        // Build prompt with full conversation history
         string|error agentResult = voiceAgent.run(transcript, self.sessionId);
+
         if agentResult is error {
             io:println("Agent error: ", agentResult.message());
-            sendText(caller, "ERROR: Agent failed — " + agentResult.message());
+            sendText(caller, string `ERROR: Agent failed — ${agentResult.message()}`);
             return;
         }
 
-
-        // LLM call
         string llmResponse = agentResult;
         io:println("Agent: ", llmResponse);
-        sendText(caller, "RESPONSE:" + llmResponse);
+        sendText(caller, string `RESPONSE:${llmResponse}`);
 
+        byte[]|error audioResult = kokoro_client:ttsWithKokoro(llmResponse);
 
-    
-        // Text-to-Speech
-        byte[]|error audioResult = ttsWithKokoro(llmResponse);
         if audioResult is error {
             io:println("TTS error: ", audioResult.message());
-            sendText(caller, "ERROR: TTS failed — " + audioResult.message());
+            sendText(caller, string `ERROR: TTS failed — ${audioResult.message()}`);
             return;
         }
 
@@ -95,6 +89,10 @@ isolated service class WsService {
     }
 }
 
+# Sends a text message to the WebSocket caller.
+#
+# + caller - The WebSocket caller
+# + msg - The text message to send
 isolated function sendText(websocket:Caller caller, string msg) {
     websocket:Error? err = caller->writeMessage(msg);
     if err is websocket:Error {
@@ -102,8 +100,10 @@ isolated function sendText(websocket:Caller caller, string msg) {
     }
 }
 
+# The main function that starts the server.
+#
+# + return - Returns an error if the server fails to start
 public function main() returns error? {
     io:println("Local Voice Agent - WebSocket server listening on ws://localhost:8002/ws");
 }
-
 

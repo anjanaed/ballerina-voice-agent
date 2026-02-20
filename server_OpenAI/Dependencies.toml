@@ -9,7 +9,7 @@ distribution-version = "2201.13.1"
 
 [[package]]
 org = "anjana_ed"
-name = "voice_agent"
+name = "server_OpenAI"
 version = "0.1.0"
 dependencies = [
 	{org = "ballerina", name = "ai"},
@@ -22,7 +22,7 @@ dependencies = [
 	{org = "ballerinax", name = "openai.audio"}
 ]
 modules = [
-	{org = "anjana_ed", packageName = "voice_agent", moduleName = "voice_agent"}
+	{org = "anjana_ed", packageName = "server_OpenAI", moduleName = "server_OpenAI"}
 ]
 
 [[package]]

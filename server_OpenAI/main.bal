@@ -3,14 +3,15 @@ import ballerina/http;
 import ballerina/io;
 import ballerina/uuid;
 import ballerina/websocket;
-import ballerinax/openai.audio;
 import ballerinax/ai.openai;
+import ballerinax/openai.audio;
 
+# The OpenAI token for accessing the GPT model.
 configurable string openaiToken = ?;
 
+# The audio client for OpenAI text-to-speech and speech-to-text.
 final audio:Client audioClient = check new ({auth: {token: openaiToken}});
 
-// Module-level agent: shared across connections, history isolated per sessionId.
 final ai:Agent voiceAgent = check new ({
     systemPrompt: {
         role: "Voice Assistant",
@@ -19,49 +20,58 @@ final ai:Agent voiceAgent = check new ({
     model: check new openai:ModelProvider(openaiToken, openai:GPT_4O)
 });
 
+# The WebSocket service listener.
 service /ws on new websocket:Listener(8001) {
+
+    # Upgrades the HTTP request to a WebSocket connection.
+    #
+    # + req - The HTTP request
+    # + return - The WebSocket service or an upgrade error
     resource function get .(http:Request req) returns websocket:Service|websocket:UpgradeError {
         return new WsService();
     }
 }
 
+# Represents the WebSocket service for the OpenAI voice agent.
 isolated service class WsService {
     *websocket:Service;
 
-    // Unique session ID per connection — the agent uses this to isolate history.
+    # Unique session ID per connection — the agent uses this to isolate history.
     private final string sessionId = uuid:createRandomUuid();
 
-    remote isolated function onMessage(websocket:Caller caller, byte[] data) {
+    # Triggered when a binary message (audio) is received from the client.
+    # Performs speech-to-text, queries the voice agent, and returns text-to-speech audio.
+    #
+    # + caller - The WebSocket caller
+    # + data - The audio data received as a byte array
+    remote isolated function onBinaryMessage(websocket:Caller caller, byte[] data) {
 
-        // Speech-to-Text
         string|error transcriptResult = speechToText(data);
         if transcriptResult is error {
             io:println("STT error: ", transcriptResult.message());
-            sendText(caller, "ERROR: transcription failed — " + transcriptResult.message());
+            sendText(caller, string `ERROR: transcription failed — ${transcriptResult.message()}`);
             return;
         }
 
         string transcript = transcriptResult;
         io:println("STT: ", transcript);
-        sendText(caller, "TRANSCRIPT:" + transcript);
+        sendText(caller, string `TRANSCRIPT:${transcript}`);
 
-        // Run agent — conversation history is managed internally per sessionId.
         string|error agentResult = voiceAgent.run(transcript, self.sessionId);
         if agentResult is error {
             io:println("Agent error: ", agentResult.message());
-            sendText(caller, "ERROR: Agent failed — " + agentResult.message());
+            sendText(caller, string `ERROR: Agent failed — ${agentResult.message()}`);
             return;
         }
 
         string llmResponse = agentResult;
         io:println("Agent: ", llmResponse);
-        sendText(caller, "RESPONSE:" + llmResponse);
+        sendText(caller, string `RESPONSE:${llmResponse}`);
 
-        // Text-to-Speech
         byte[]|error audioResult = textToSpeech(llmResponse);
         if audioResult is error {
             io:println("TTS error: ", audioResult.message());
-            sendText(caller, "ERROR: TTS failed — " + audioResult.message());
+            sendText(caller, string `ERROR: TTS failed — ${audioResult.message()}`);
             return;
         }
 
@@ -72,7 +82,10 @@ isolated service class WsService {
     }
 }
 
-/// Sends a plain-text WebSocket frame. Errors are logged, never propagated.
+# Sends a plain-text WebSocket frame. Errors are logged, never propagated.
+#
+# + caller - The WebSocket caller
+# + msg - The text message to send
 isolated function sendText(websocket:Caller caller, string msg) {
     websocket:Error? err = caller->writeMessage(msg);
     if err is websocket:Error {
@@ -80,7 +93,10 @@ isolated function sendText(websocket:Caller caller, string msg) {
     }
 }
 
-/// Transcribes raw audio bytes via OpenAI Whisper.
+# Transcribes raw audio bytes via OpenAI Whisper.
+#
+# + data - The audio data received as a byte array
+# + return - The transcribed text or an error
 isolated function speechToText(byte[] data) returns string|error {
     audio:CreateTranscriptionRequest request = {
         model: "whisper-1",
@@ -90,7 +106,10 @@ isolated function speechToText(byte[] data) returns string|error {
     return response.text;
 }
 
-/// Converts text to speech audio via OpenAI TTS.
+# Converts text to speech audio via OpenAI TTS.
+#
+# + text - The text to convert to speech
+# + return - The audio data as a byte array or an error
 isolated function textToSpeech(string text) returns byte[]|error {
     audio:CreateSpeechRequest request = {
         model: "tts-1",
@@ -100,6 +119,9 @@ isolated function textToSpeech(string text) returns byte[]|error {
     return check audioClient->/audio/speech.post(request);
 }
 
+# The main function that starts the server.
+#
+# + return - Returns an error if the server fails to start
 public function main() returns error? {
     io:println("WebSocket server listening on ws://localhost:8001/ws");
 }

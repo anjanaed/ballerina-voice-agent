@@ -8,10 +8,8 @@ import ballerina/uuid;
 import ballerina/websocket;
 import ballerinax/ai.openai;
 
-# The OpenAI token for accessing the GPT model.
 configurable string openaiToken = ?;
 
-# The AI model provider instance, initialized with the GPT-4O model.
 final ai:ModelProvider model = check new openai:ModelProvider(openaiToken, openai:GPT_4O);
 
 final ai:Agent voiceAgent = check new ({
@@ -28,8 +26,6 @@ final ai:Agent voiceAgent = check new ({
 }
 service /ws on new websocket:Listener(8002) {
 
-    # Upgrades the HTTP request to a WebSocket connection.
-    #
     # + req - The HTTP request
     # + return - The WebSocket service or an upgrade error
     resource function get .(http:Request req) returns websocket:Service|websocket:UpgradeError {
@@ -37,7 +33,6 @@ service /ws on new websocket:Listener(8002) {
     }
 }
 
-# Represents the WebSocket service for the local voice agent.
 isolated service class WsService {
     *websocket:Service;
 
@@ -46,8 +41,6 @@ isolated service class WsService {
 
     # Triggered when a binary message (audio) is received from the client.
     # Performs speech-to-text, queries the local voice agent, and returns text-to-speech audio.
-    # Per-connection conversation history is maintained implicitly by the session context.
-    #
     # + caller - The WebSocket caller
     # + data - The audio data received as a byte array
     remote isolated function onBinaryMessage(websocket:Caller caller, byte[] data) {
@@ -75,7 +68,6 @@ isolated service class WsService {
 
         string llmResponse = agentResult;
         io:println("Agent: ", llmResponse);
-        sendText(caller, string `RESPONSE:${llmResponse}`);
 
         byte[]|error audioResult = kokoro_client:ttsWithKokoro(llmResponse);
 
@@ -89,6 +81,8 @@ isolated service class WsService {
         if audioErr is websocket:Error {
             io:println("Failed to send audio: ", audioErr.message());
         }
+        sendText(caller, string `RESPONSE:${llmResponse}`);
+
     }
 }
 
@@ -103,8 +97,6 @@ isolated function sendText(websocket:Caller caller, string msg) {
     }
 }
 
-# The main function that starts the server.
-#
 # + return - Returns an error if the server fails to start
 public function main() returns error? {
     io:println("Local Voice Agent - WebSocket server listening on ws://localhost:8002/ws");

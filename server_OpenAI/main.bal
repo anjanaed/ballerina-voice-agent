@@ -6,10 +6,8 @@ import ballerina/websocket;
 import ballerinax/ai.openai;
 import ballerinax/openai.audio;
 
-# The OpenAI token for accessing the GPT model.
 configurable string openaiToken = ?;
 
-# The audio client for OpenAI text-to-speech and speech-to-text.
 final audio:Client audioClient = check new ({auth: {token: openaiToken}});
 
 final ai:Agent voiceAgent = check new ({
@@ -26,8 +24,6 @@ final ai:Agent voiceAgent = check new ({
 }
 service /ws on new websocket:Listener(8001) {
 
-    # Upgrades the HTTP request to a WebSocket connection.
-    #
     # + req - The HTTP request
     # + return - The WebSocket service or an upgrade error
     resource function get .(http:Request req) returns websocket:Service|websocket:UpgradeError {
@@ -35,15 +31,13 @@ service /ws on new websocket:Listener(8001) {
     }
 }
 
-# Represents the WebSocket service for the OpenAI voice agent.
+# WebSocket service for the OpenAI voice agent.
 isolated service class WsService {
     *websocket:Service;
 
-    # Unique session ID per connection — the agent uses this to isolate history.
     private final string sessionId = uuid:createRandomUuid();
 
     # Triggered when a binary message (audio) is received from the client.
-    # Performs speech-to-text, queries the voice agent, and returns text-to-speech audio.
     #
     # + caller - The WebSocket caller
     # + data - The audio data received as a byte array
@@ -69,7 +63,6 @@ isolated service class WsService {
 
         string llmResponse = agentResult;
         io:println("Agent: ", llmResponse);
-        sendText(caller, string `RESPONSE:${llmResponse}`);
 
         byte[]|error audioResult = textToSpeech(llmResponse);
         if audioResult is error {
@@ -82,10 +75,12 @@ isolated service class WsService {
         if audioErr is websocket:Error {
             io:println("Failed to send audio to client: ", audioErr.message());
         }
+        sendText(caller, string `RESPONSE:${llmResponse}`);
+
     }
 }
 
-# Sends a plain-text WebSocket frame. Errors are logged, never propagated.
+# Sends a plain-text WebSocket frame.
 #
 # + caller - The WebSocket caller
 # + msg - The text message to send
@@ -122,8 +117,7 @@ isolated function textToSpeech(string text) returns byte[]|error {
     return check audioClient->/audio/speech.post(request);
 }
 
-# The main function that starts the server.
-#
+
 # + return - Returns an error if the server fails to start
 public function main() returns error? {
     io:println("WebSocket server listening on ws://localhost:8001/ws");

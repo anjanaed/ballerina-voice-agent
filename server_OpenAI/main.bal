@@ -21,6 +21,9 @@ final ai:Agent voiceAgent = check new ({
 });
 
 # The WebSocket service listener.
+@websocket:ServiceConfig {
+    maxFrameSize: 104857600
+}
 service /ws on new websocket:Listener(8001) {
 
     # Upgrades the HTTP request to a WebSocket connection.

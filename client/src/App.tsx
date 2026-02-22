@@ -9,7 +9,7 @@ import './App.css';
 const WAVE_DURATIONS = Array.from({ length: 12 }, () => 0.5 + Math.random() * 0.55);
 
 function App() {
-  const [selectedPort, setSelectedPort] = useState('8002');
+  const [selectedPort] = useState(() => localStorage.getItem('selectedPort') || '8002');
 
   const { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage } =
     useWebSocket(`ws://localhost:${selectedPort}/ws`);
@@ -21,7 +21,7 @@ function App() {
 
   const { isRecording, volume, silenceSecondsLeft, startRecording, stopRecording } = useAudio({
     onSilence: handleSilence,
-    silenceThreshold: 4000,
+    silenceThreshold: 2000,
   });
 
   const toggleRecording = useCallback(() => {
@@ -104,8 +104,8 @@ function App() {
                       key={port.id}
                       whileHover={{ backgroundColor: 'rgba(255,255,255,0.08)', x: 4 }}
                       onClick={() => {
-                        setSelectedPort(port.id);
-                        setIsDropdownOpen(false);
+                        localStorage.setItem('selectedPort', port.id);
+                        window.location.reload();
                       }}
                       className={`dropdown-item ${selectedPort === port.id ? 'selected' : ''}`}
                     >
@@ -249,7 +249,7 @@ function App() {
         </div>
 
         <AnimatePresence>
-          {!isConnected && (
+          {!isConnected && !isConnecting && (
             <div className="offline-warning">
               Reconnecting to server…
             </div>

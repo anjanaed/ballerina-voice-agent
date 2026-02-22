@@ -1,12 +1,12 @@
+import server_local.kokoro_client;
+import server_local.whisper_client;
+
 import ballerina/ai;
 import ballerina/http;
 import ballerina/io;
 import ballerina/uuid;
 import ballerina/websocket;
 import ballerinax/ai.openai;
-
-import server_local.kokoro_client;
-import server_local.whisper_client;
 
 # The OpenAI token for accessing the GPT model.
 configurable string openaiToken = ?;
@@ -23,6 +23,9 @@ final ai:Agent voiceAgent = check new ({
 });
 
 # The WebSocket service listener.
+@websocket:ServiceConfig {
+    maxFrameSize: 104857600
+}
 service /ws on new websocket:Listener(8002) {
 
     # Upgrades the HTTP request to a WebSocket connection.

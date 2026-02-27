@@ -71,41 +71,76 @@ function AssistantUI({
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; text: string }>>([]);
   const conversationEndRef = useRef<HTMLDivElement>(null);
 
+  // Debug: log messages state changes
+  useEffect(() => {
+    console.log('[Frontend] Messages state updated:', messages.length, 'messages', messages);
+  }, [messages]);
+
   // Auto-scroll to latest message
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   useEffect(() => {
-    const onData = (payload: Uint8Array, _participant?: any, _kind?: any, topic?: string) => {
+    if (!isConnected || !room) {
+      console.log('[Frontend] Skipping DataReceived setup - not connected or no room');
+      return;
+    }
+
+    const onData = (payload: Uint8Array, participant?: any, _kind?: any, topic?: string) => {
+      console.log('[Frontend] DataReceived event fired!', { 
+        topic, 
+        payloadLength: payload.length,
+        fromParticipant: participant?.identity 
+      });
       try {
         const raw = new TextDecoder().decode(payload);
+        console.log('[Frontend] Raw data:', raw);
+        console.log('[Frontend] Raw bytes:', Array.from(payload.slice(0, 20)));
         const data = JSON.parse(raw) as { type?: string; text?: string };
+        console.log('[Frontend] Parsed data:', data);
 
         const supportedType = data?.type === 'stt' || data?.type === 'assistant';
         const fromKnownTopic = topic === 'voice-text' || topic === undefined || topic === '';
         const text = data.text;
+        
+        console.log('[Frontend] Validation:', { supportedType, fromKnownTopic, hasText: !!text });
+        
         if (!supportedType || !fromKnownTopic || !text) {
+          console.log('[Frontend] Message rejected:', { supportedType, fromKnownTopic, hasText: !!text });
           return;
         }
 
         if (data.type === 'stt') {
-          setMessages((prev) => [...prev, { role: 'user', text }]);
+          console.log('[Frontend] Adding user message:', text);
+          setMessages((prev) => {
+            const updated = [...prev, { role: 'user', text }];
+            console.log('[Frontend] Updated messages state:', updated.length, 'messages');
+            return updated;
+          });
           setMode('processing');
           return;
         }
 
-        setMessages((prev) => [...prev, { role: 'assistant', text }]);
+        console.log('[Frontend] Adding assistant message:', text);
+        setMessages((prev) => {
+          const updated = [...prev, { role: 'assistant', text }];
+          console.log('[Frontend] Updated messages state:', updated.length, 'messages');
+          return updated;
+        });
       } catch (err) {
         console.error('[Frontend] Failed to parse data message', err);
       }
     };
 
+    console.log('[Frontend] Setting up DataReceived listener on room:', room.name, 'state:', room.state);
     room.on(RoomEvent.DataReceived, onData);
+    
     return () => {
+      console.log('[Frontend] Removing DataReceived listener');
       room.off(RoomEvent.DataReceived, onData);
     };
-  }, [room]);
+  }, [room, isConnected]);
 
   useEffect(() => {
     if (!isConnected) {
@@ -215,8 +250,7 @@ function AssistantUI({
           </div>
         )}
 
-        <div className="conversation-panel">
-          {messages.length === 0 && !isProcessing && (
+        <div className="conversation-panel">          {messages.length === 0 && !isProcessing && (
             <div className="conversation-empty" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, color: 'rgba(255,255,255,0.15)', fontSize: '0.9rem', letterSpacing: '0.5px' }}>
               {isConnected ? 'Start speaking to see the conversation here…' : 'Connect to begin your conversation'}
             </div>
@@ -332,8 +366,8 @@ function App() {
     try {
       setIsFetching(true);
       setError(null);
-      console.log('[Frontend] Fetching token from http://localhost:8002/getToken...');
-      const response = await fetch('http://localhost:8002/getToken?roomName=voice-room&participantName=user');
+      console.log('[Frontend] Fetching token from http://localhost:8006/getToken...');
+      const response = await fetch('http://localhost:8006/getToken?roomName=voice-room&participantName=user');
       if (!response.ok) {
         throw new Error('Failed to fetch token from backend');
       }
@@ -357,7 +391,7 @@ function App() {
       token={connectionDetails?.token}
       serverUrl={connectionDetails?.url}
       connect={!!connectionDetails}
-      audio={true}
+      audio={false}
       onDisconnected={disconnect}
     >
       <AssistantUI connectAgent={connect} onDisconnect={disconnect} isFetching={isFetching} error={error} />

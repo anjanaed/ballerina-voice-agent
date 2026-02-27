@@ -6,15 +6,16 @@ import json
 from dotenv import load_dotenv
 
 from livekit import rtc
-import openai
+from websockets.asyncio.client import connect as ws_connect
 
 load_dotenv()
 
-openai_client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
 # Audio settings
-SAMPLE_RATE = 16000 # for reading
+SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
+
+BALLERINA_WS_URL = "ws://localhost:8002/ws"
+TTS_FRAME_MS = 20
 
 def create_wav_buffer(pcm_data: bytes, sample_rate: int) -> io.BytesIO:
     wav_io = io.BytesIO()
@@ -30,12 +31,6 @@ def create_wav_buffer(pcm_data: bytes, sample_rate: int) -> io.BytesIO:
 audio_source: rtc.AudioSource | None = None
 tts_track_published = False
 tts_lock = asyncio.Lock()
-
-TTS_SAMPLE_RATE = 24000
-TTS_CHANNELS = 1
-TTS_FRAME_MS = 20
-TTS_SAMPLES_PER_FRAME = (TTS_SAMPLE_RATE * TTS_FRAME_MS) // 1000
-TTS_BYTES_PER_FRAME = TTS_SAMPLES_PER_FRAME * TTS_CHANNELS * 2
 
 
 async def ensure_tts_track_published(room: rtc.Room):
@@ -53,9 +48,11 @@ async def ensure_tts_track_published(room: rtc.Room):
     print("TTS track published")
 
 
-def publish_text_event(room: rtc.Room, message_type: str, text: str):
-    payload = json.dumps({"type": message_type, "text": text})
-    room.local_participant.publish_data(payload, reliable=True, topic="voice-text")
+async def publish_text_event(room: rtc.Room, message_type: str, text: str):
+    payload = json.dumps({"type": message_type, "text": text}).encode('utf-8')
+    print(f"[Backend] Publishing data event: type={message_type}, text='{text}', payload_size={len(payload)} bytes")
+    await room.local_participant.publish_data(payload, reliable=True, topic="voice-text")
+    print(f"[Backend] Data published successfully")
 
 def request_audio_subscriptions(room: rtc.Room):
     for identity, participant in room.remote_participants.items():
@@ -69,113 +66,83 @@ def request_audio_subscriptions(room: rtc.Room):
                     flush=True,
                 )
 
-async def log_subscription_state(room: rtc.Room):
-    while room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
-        for identity, participant in room.remote_participants.items():
-            for publication in participant.track_publications.values():
-                if publication.kind == rtc.TrackKind.KIND_AUDIO:
-                    if not publication.subscribed:
-                        publication.set_subscribed(True)
-                    print(
-                        f"[Backend] SubState participant={identity} sid={publication.sid} "
-                        f"subscribed={publication.subscribed} muted={publication.muted} "
-                        f"has_track={publication.track is not None}",
-                        flush=True,
-                    )
-        await asyncio.sleep(5)
+
+async def stream_wav_to_livekit(wav_bytes: bytes):
+    """Decode a WAV buffer from Kokoro and push PCM frames into the LiveKit AudioSource."""
+    global audio_source
+    if audio_source is None:
+        return
+
+    wav_io = io.BytesIO(wav_bytes)
+    with wave.open(wav_io, 'rb') as wf:
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        pcm = wf.readframes(wf.getnframes())
+
+    frame_samples = (rate * TTS_FRAME_MS) // 1000
+    frame_bytes_size = frame_samples * channels * 2
+    pending = bytearray(pcm)
+
+    async with tts_lock:
+        while len(pending) >= frame_bytes_size:
+            chunk = bytes(pending[:frame_bytes_size])
+            del pending[:frame_bytes_size]
+            await audio_source.capture_frame(
+                rtc.AudioFrame(chunk, rate, channels, frame_samples)
+            )
+        if pending:
+            if len(pending) % 2 != 0:
+                pending.append(0)
+            spc = len(pending) // (2 * channels)
+            if spc > 0:
+                await audio_source.capture_frame(
+                    rtc.AudioFrame(bytes(pending), rate, channels, spc)
+                )
+
 
 async def process_speech(audio_data: bytes, room: rtc.Room):
-    global audio_source
+    """Send audio to Ballerina over WebSocket and handle the STT/LLM/TTS pipeline."""
     print("Processing speech chunk...")
-    # 1. STT
-    wav_buffer = create_wav_buffer(audio_data, SAMPLE_RATE)
+    wav_bytes = create_wav_buffer(audio_data, SAMPLE_RATE).read()
+
     try:
-        print("Sending to STT...")
-        transcription = await openai_client.audio.transcriptions.create(
-            model="whisper-1", 
-            file=wav_buffer
-        )
-        text = transcription.text.strip()
-        # audio_seconds = len(audio_data) / (2 * NUM_CHANNELS * SAMPLE_RATE)
-        # print(
-        #     f"[Backend][STT_OK] bytes={len(audio_data)} duration={audio_seconds:.2f}s sample_rate={SAMPLE_RATE} text='{text}'",
-        #     flush=True,
-        # )
-        print(f"STT Output: {text}")
-        if not text:
-            return
-        publish_text_event(room, "stt", text)
+        async with ws_connect(BALLERINA_WS_URL, max_size=10 * 1024 * 1024) as ws:
+            await ws.send(wav_bytes)
+            print("Sent audio to Ballerina, waiting for response...")
 
-        # 2. LLM
-        print("Sending to LLM...")
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful, friendly voice assistant. Keep responses concise and conversational (1-3 sentences). Return only the spoken response — no markdown, no lists."
-                },
-                {"role": "user", "content": text}
-            ]
-        )
-        llm_text = response.choices[0].message.content
-        print(f"LLM Output: {llm_text}")
-        if llm_text:
-            publish_text_event(room, "assistant", llm_text)
+            tts_wav: bytes | None = None
 
-        # 3. TTS - stream back to frontend via LiveKit
-        if audio_source is None:
-            print("[Backend] Audio source not initialized; skipping TTS")
-            return
+            async for msg in ws:
+                if isinstance(msg, bytes):
+                    tts_wav = msg
+                    print(f"Received TTS audio: {len(tts_wav)} bytes")
 
-        await ensure_tts_track_published(room)
-        
-        print("Sending to TTS...")
-        async with tts_lock:
-            tts_response = await openai_client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=llm_text,
-                response_format="pcm",
-                stream_format="audio",
-            )
+                elif isinstance(msg, str):
+                    if msg.startswith("TRANSCRIPT:"):
+                        text = msg[len("TRANSCRIPT:"):]
+                        print(f"STT Output: {text}")
+                        await publish_text_event(room, "stt", text)
 
+                    elif msg.startswith("RESPONSE:"):
+                        llm_text = msg[len("RESPONSE:"):]
+                        print(f"LLM Output: {llm_text}")
+                        await publish_text_event(room, "assistant", llm_text)
+                        break
+
+                    elif msg.startswith("ERROR:"):
+                        print(f"Ballerina error: {msg}")
+                        return
+
+        if tts_wav:
+            await ensure_tts_track_published(room)
             print("Streaming TTS to Room...")
-            pending = bytearray()
-            byte_stream = await tts_response.aiter_bytes()
-            async for chunk in byte_stream:
-                if not chunk:
-                    continue
-                pending.extend(chunk)
-
-                while len(pending) >= TTS_BYTES_PER_FRAME:
-                    frame_bytes = bytes(pending[:TTS_BYTES_PER_FRAME])
-                    del pending[:TTS_BYTES_PER_FRAME]
-                    frame = rtc.AudioFrame(
-                        frame_bytes,
-                        TTS_SAMPLE_RATE,
-                        TTS_CHANNELS,
-                        TTS_SAMPLES_PER_FRAME,
-                    )
-                    await audio_source.capture_frame(frame)
-
-            if pending:
-                if len(pending) % 2 != 0:
-                    pending.append(0)
-                samples_per_channel = len(pending) // (2 * TTS_CHANNELS)
-                if samples_per_channel > 0:
-                    frame = rtc.AudioFrame(
-                        bytes(pending),
-                        TTS_SAMPLE_RATE,
-                        TTS_CHANNELS,
-                        samples_per_channel,
-                    )
-                    await audio_source.capture_frame(frame)
-            
-        print("Done streaming TTS.")
+            await stream_wav_to_livekit(tts_wav)
+            print("Done streaming TTS.")
 
     except Exception as e:
         print(f"Error in pipeline: {e}")
+        import traceback
+        traceback.print_exc()
 
 async def handle_audio_stream(track: rtc.Track, room: rtc.Room):
     audio_stream = rtc.AudioStream(track)
@@ -183,21 +150,10 @@ async def handle_audio_stream(track: rtc.Track, room: rtc.Room):
     min_chunk_seconds = 0.5
     was_muted = track.muted
     
-    print("🎧 Started listening to audio stream...")
-    first_frame = True
-    frame_count = 0
+    print("Started listening to audio stream...")
     
     async for event in audio_stream:
         audio_frame = event.frame
-
-        if first_frame:
-            print(f"✅ RECEIVING DATA! Sample rate: {audio_frame.sample_rate}Hz, Channels: {audio_frame.num_channels}")
-            first_frame = False
-            
-        frame_count += 1
-        
-        # Log every 100 frames to show data is flowing
-
             
         global SAMPLE_RATE
         SAMPLE_RATE = audio_frame.sample_rate
@@ -205,7 +161,7 @@ async def handle_audio_stream(track: rtc.Track, room: rtc.Room):
         is_muted = track.muted
 
         if was_muted and not is_muted:
-            print("🎙️ Track unmuted, starting new capture segment...")
+            print("Track unmuted, starting new capture segment...")
             buffer.clear()
 
         if not is_muted:
@@ -215,7 +171,7 @@ async def handle_audio_stream(track: rtc.Track, room: rtc.Room):
         if not was_muted and is_muted:
             buffered_seconds = len(buffer) / (2 * NUM_CHANNELS * SAMPLE_RATE)
             if buffered_seconds >= min_chunk_seconds:
-                print("🔇 Track muted, sending captured segment to pipeline...")
+                print("Track muted, sending captured segment to pipeline...")
                 audio_to_process = bytes(buffer)
                 asyncio.create_task(process_speech(audio_to_process, room))
             else:
@@ -234,7 +190,7 @@ async def handle_audio_stream(track: rtc.Track, room: rtc.Room):
 def register_room_handlers(room: rtc.Room):
     @room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-        print(f"[Backend] ✅ Track subscribed: {participant.identity} - {track.kind}")
+        print(f"[Backend] Track subscribed: {participant.identity} - {track.kind}")
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             asyncio.create_task(handle_audio_stream(track, room))
 
@@ -256,15 +212,15 @@ def register_room_handlers(room: rtc.Room):
 
     @room.on("track_subscription_failed")
     def on_track_subscription_failed(participant: rtc.RemoteParticipant, track_sid: str, error: str):
-        print(f"[Backend] ❌ Track subscription failed: participant={participant.identity}, sid={track_sid}, error={error}")
+        print(f"[Backend] Track subscription failed: participant={participant.identity}, sid={track_sid}, error={error}")
 
     @room.on("track_muted")
     def on_track_muted(participant: rtc.Participant, publication: rtc.TrackPublication):
-        print(f"[Backend] 🔇 Track muted: participant={participant.identity}, sid={publication.sid}")
+        print(f"[Backend] Track muted: participant={participant.identity}, sid={publication.sid}")
 
     @room.on("track_unmuted")
     def on_track_unmuted(participant: rtc.Participant, publication: rtc.TrackPublication):
-        print(f"[Backend] 🔊 Track unmuted: participant={participant.identity}, sid={publication.sid}")
+        print(f"[Backend] Track unmuted: participant={participant.identity}, sid={publication.sid}")
 
     @room.on("connection_state_changed")
     def on_connection_state_changed(state: rtc.ConnectionState):
@@ -295,6 +251,7 @@ async def main():
             room="voice-room",
             can_subscribe=True,
             can_publish=True,
+            can_publish_data=True,
         )) \
         .to_jwt()
     
@@ -332,7 +289,6 @@ async def main():
                         )
         
         print("[Backend] Ready", flush=True)
-        state_task = asyncio.create_task(log_subscription_state(room))
     except Exception as e:
         print(f"[Backend] ERROR during connection: {e}", flush=True)
         import traceback
@@ -345,8 +301,6 @@ async def main():
     except KeyboardInterrupt:
         print("[Backend] Shutting down...")
     finally:
-        if 'state_task' in locals():
-            state_task.cancel()
         await room.disconnect()
 
 if __name__ == "__main__":

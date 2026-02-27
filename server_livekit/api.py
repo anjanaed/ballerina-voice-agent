@@ -48,4 +48,4 @@ route = app.router.add_get('/getToken', handle_token)
 cors.add(route)
 
 if __name__ == "__main__":
-    web.run_app(app, port=8002)
+    web.run_app(app, port=8006)

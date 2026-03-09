@@ -12,6 +12,83 @@ import {
 import { ConnectionState, ParticipantEvent, RoomEvent } from 'livekit-client';
 import './App.css';
 
+type TracePayload = {
+  trace_id?: string;
+  client_mic_off_ms?: number;
+  py_capture_start_ms?: number;
+  py_send_bal_ms?: number;
+  py_first_tts_frame_out_ms?: number;
+  python_to_ballerina_ms?: number;
+  stt_ms?: number;
+  llm_ms?: number;
+  tts_ms?: number;
+  ballerina_to_python_ms?: number;
+};
+
+type NetSample = {
+  candidate_pair_rtt_ms?: number;
+  remote_inbound_rtt_ms?: number;
+  outbound_packets_sent?: number;
+  outbound_bytes_sent?: number;
+  outbound_total_packet_send_delay_ms?: number;
+};
+
+async function collectWebRtcNetSample(room: any): Promise<NetSample | null> {
+  try {
+    const pc =
+      room?.engine?.publisher?.pc ??
+      room?.engine?.pcManager?.publisher?.pc ??
+      room?.engine?.client?.pcManager?.publisher?.pc;
+
+    if (!pc?.getStats) {
+      return null;
+    }
+
+    const report: RTCStatsReport = await pc.getStats();
+    let candidatePairRttMs: number | undefined;
+    let remoteInboundRttMs: number | undefined;
+    let outboundPacketsSent: number | undefined;
+    let outboundBytesSent: number | undefined;
+    let outboundTotalPacketSendDelayMs: number | undefined;
+
+    for (const stat of report.values() as Iterable<any>) {
+      if (stat.type === 'candidate-pair' && (stat.nominated || stat.selected)) {
+        if (typeof stat.currentRoundTripTime === 'number') {
+          candidatePairRttMs = stat.currentRoundTripTime * 1000;
+        }
+      }
+
+      if (stat.type === 'remote-inbound-rtp' && stat.kind === 'audio') {
+        if (typeof stat.roundTripTime === 'number') {
+          remoteInboundRttMs = stat.roundTripTime * 1000;
+        }
+      }
+
+      if (stat.type === 'outbound-rtp' && stat.kind === 'audio') {
+        if (typeof stat.packetsSent === 'number') {
+          outboundPacketsSent = stat.packetsSent;
+        }
+        if (typeof stat.bytesSent === 'number') {
+          outboundBytesSent = stat.bytesSent;
+        }
+        if (typeof stat.totalPacketSendDelay === 'number') {
+          outboundTotalPacketSendDelayMs = stat.totalPacketSendDelay * 1000;
+        }
+      }
+    }
+
+    return {
+      candidate_pair_rtt_ms: candidatePairRttMs,
+      remote_inbound_rtt_ms: remoteInboundRttMs,
+      outbound_packets_sent: outboundPacketsSent,
+      outbound_bytes_sent: outboundBytesSent,
+      outbound_total_packet_send_delay_ms: outboundTotalPacketSendDelayMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
 const WAVE_DURATIONS = Array.from({ length: 12 }, () => 0.5 + Math.random() * 0.55);
 
 function AssistantUI({ 
@@ -34,47 +111,15 @@ function AssistantUI({
   const remoteParticipants = useRemoteParticipants();
   const assistantParticipant = remoteParticipants.length > 0 ? remoteParticipants[0] : null;
 
-  // Debug logging
-  useEffect(() => {
-    console.log('[Frontend] Connection state:', connectionState);
-  }, [connectionState]);
-
-  useEffect(() => {
-    console.log('[Frontend] Microphone enabled:', isMicrophoneEnabled);
-  }, [isMicrophoneEnabled]);
-
-  useEffect(() => {
-    console.log('[Frontend] Remote participants:', remoteParticipants.length);
-    remoteParticipants.forEach((p, i) => {
-      console.log(`[Frontend] Participant ${i}:`, p.identity, 'Tracks:', p.trackPublications.size);
-    });
-  }, [remoteParticipants]);
-
-  // Debug: Monitor local track publications
-  useEffect(() => {
-    if (!localParticipant) return;
-    
-    console.log('[Frontend] Local participant tracks:', {
-      audioTracks: Array.from(localParticipant.audioTrackPublications.values()).map(pub => ({
-        sid: pub.trackSid,
-        name: pub.trackName,
-        muted: pub.isMuted,
-        enabled: pub.track?.mediaStreamTrack?.enabled,
-        readyState: pub.track?.mediaStreamTrack?.readyState
-      })),
-      totalPublications: localParticipant.trackPublications.size
-    });
-  }, [localParticipant, isMicrophoneEnabled]);
-
   const [assistantIsSpeaking, setAssistantIsSpeaking] = useState(false);
   const [localIsSpeaking, setLocalIsSpeaking] = useState(false);
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; text: string }>>([]);
   const conversationEndRef = useRef<HTMLDivElement>(null);
-
-  // Debug: log messages state changes
-  useEffect(() => {
-    console.log('[Frontend] Messages state updated:', messages.length, 'messages', messages);
-  }, [messages]);
+  const latestAssistantTraceRef = useRef<TracePayload | null>(null);
+  const currentTraceIdRef = useRef<string | null>(null);
+  const traceNetStartRef = useRef<{ trace_id: string; sample: NetSample } | null>(null);
+  const dcPingSentRef = useRef<Map<string, number>>(new Map());
+  const dcRttMsRef = useRef<Map<string, number>>(new Map());
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -83,61 +128,48 @@ function AssistantUI({
 
   useEffect(() => {
     if (!isConnected || !room) {
-      console.log('[Frontend] Skipping DataReceived setup - not connected or no room');
       return;
     }
 
-    const onData = (payload: Uint8Array, participant?: any, _kind?: any, topic?: string) => {
-      console.log('[Frontend] DataReceived event fired!', { 
-        topic, 
-        payloadLength: payload.length,
-        fromParticipant: participant?.identity 
-      });
+    const onData = (payload: Uint8Array, _participant?: any, _kind?: any, topic?: string) => {
       try {
         const raw = new TextDecoder().decode(payload);
-        console.log('[Frontend] Raw data:', raw);
-        console.log('[Frontend] Raw bytes:', Array.from(payload.slice(0, 20)));
-        const data = JSON.parse(raw) as { type?: string; text?: string };
-        console.log('[Frontend] Parsed data:', data);
+        const data = JSON.parse(raw) as { type?: string; text?: string; trace?: TracePayload; trace_id?: string };
+
+        // Handle DataChannel RTT measurement (trace_ack echo from Python)
+        if (data?.type === 'trace_ack' && data.trace_id) {
+          const sentAt = dcPingSentRef.current.get(data.trace_id);
+          if (sentAt !== undefined) {
+            dcRttMsRef.current.set(data.trace_id, Date.now() - sentAt);
+            dcPingSentRef.current.delete(data.trace_id);
+          }
+          return;
+        }
 
         const supportedType = data?.type === 'stt' || data?.type === 'assistant';
         const fromKnownTopic = topic === 'voice-text' || topic === undefined || topic === '';
         const text = data.text;
-        
-        console.log('[Frontend] Validation:', { supportedType, fromKnownTopic, hasText: !!text });
-        
+
         if (!supportedType || !fromKnownTopic || !text) {
-          console.log('[Frontend] Message rejected:', { supportedType, fromKnownTopic, hasText: !!text });
           return;
         }
 
         if (data.type === 'stt') {
-          console.log('[Frontend] Adding user message:', text);
-          setMessages((prev) => {
-            const updated = [...prev, { role: 'user', text }];
-            console.log('[Frontend] Updated messages state:', updated.length, 'messages');
-            return updated;
-          });
+          setMessages((prev) => [...prev, { role: 'user', text }]);
           setMode('processing');
           return;
         }
 
-        console.log('[Frontend] Adding assistant message:', text);
-        setMessages((prev) => {
-          const updated = [...prev, { role: 'assistant', text }];
-          console.log('[Frontend] Updated messages state:', updated.length, 'messages');
-          return updated;
-        });
+        latestAssistantTraceRef.current = data.trace ?? null;
+        setMessages((prev) => [...prev, { role: 'assistant', text }]);
       } catch (err) {
-        console.error('[Frontend] Failed to parse data message', err);
+        console.error('Failed to parse data message', err);
       }
     };
 
-    console.log('[Frontend] Setting up DataReceived listener on room:', room.name, 'state:', room.state);
     room.on(RoomEvent.DataReceived, onData);
     
     return () => {
-      console.log('[Frontend] Removing DataReceived listener');
       room.off(RoomEvent.DataReceived, onData);
     };
   }, [room, isConnected]);
@@ -158,6 +190,81 @@ function AssistantUI({
     setAssistantIsSpeaking(assistantParticipant.isSpeaking);
     return () => { assistantParticipant.off(ParticipantEvent.IsSpeakingChanged, onSpeaking); };
   }, [assistantParticipant]);
+
+  useEffect(() => {
+    if (!assistantIsSpeaking) {
+      return;
+    }
+
+    const trace = latestAssistantTraceRef.current;
+    if (!trace) {
+      return;
+    }
+
+    const traceId = trace.trace_id;
+    const dcRttMs = traceId ? dcRttMsRef.current.get(traceId) : undefined;
+
+    console.log('[TRACE_RESULT]', {
+      ...trace,
+      ...(dcRttMs !== undefined ? {
+        datachannel_rtt_ms: dcRttMs,
+        frontend_to_python_ms: Math.round(dcRttMs / 2),
+        python_to_frontend_ms: Math.round(dcRttMs / 2),
+      } : {}),
+    });
+
+    if (traceId) {
+      dcRttMsRef.current.delete(traceId);
+    }
+
+    if (!traceId || !room) {
+      return;
+    }
+
+    void (async () => {
+      const endSample = await collectWebRtcNetSample(room);
+      const start = traceNetStartRef.current;
+
+      if (!endSample) {
+        return;
+      }
+
+      const result: Record<string, number | string | undefined> = {
+        trace_id: traceId,
+        start_candidate_pair_rtt_ms: start?.trace_id === traceId ? start.sample.candidate_pair_rtt_ms : undefined,
+        end_candidate_pair_rtt_ms: endSample.candidate_pair_rtt_ms,
+        start_remote_inbound_rtt_ms: start?.trace_id === traceId ? start.sample.remote_inbound_rtt_ms : undefined,
+        end_remote_inbound_rtt_ms: endSample.remote_inbound_rtt_ms,
+      };
+
+      if (
+        start?.trace_id === traceId &&
+        typeof start.sample.outbound_packets_sent === 'number' &&
+        typeof endSample.outbound_packets_sent === 'number'
+      ) {
+        result.delta_outbound_packets_sent = endSample.outbound_packets_sent - start.sample.outbound_packets_sent;
+      }
+
+      if (
+        start?.trace_id === traceId &&
+        typeof start.sample.outbound_bytes_sent === 'number' &&
+        typeof endSample.outbound_bytes_sent === 'number'
+      ) {
+        result.delta_outbound_bytes_sent = endSample.outbound_bytes_sent - start.sample.outbound_bytes_sent;
+      }
+
+      if (
+        start?.trace_id === traceId &&
+        typeof start.sample.outbound_total_packet_send_delay_ms === 'number' &&
+        typeof endSample.outbound_total_packet_send_delay_ms === 'number'
+      ) {
+        result.delta_outbound_packet_send_delay_ms =
+          endSample.outbound_total_packet_send_delay_ms - start.sample.outbound_total_packet_send_delay_ms;
+      }
+
+      console.log('[TRACE_NET]', result);
+    })();
+  }, [assistantIsSpeaking]);
 
   useEffect(() => {
     if (!localParticipant) {
@@ -188,13 +295,39 @@ function AssistantUI({
   }, [assistantIsSpeaking, localIsSpeaking, isMicrophoneEnabled, isConnected, isConnecting, mode]);
 
   const toggleRecording = useCallback(() => {
-    console.log('[Frontend] Toggling microphone. Current state:', isMicrophoneEnabled);
     if (isMicrophoneEnabled) {
+      const now = Date.now();
+      const traceId = `trace_${now}_${Math.random().toString(36).slice(2, 8)}`;
+      currentTraceIdRef.current = traceId;
+      dcPingSentRef.current.set(traceId, now);
+      const traceMessage = {
+        type: 'trace_marker',
+        trace_id: traceId,
+        client_mic_off_ms: now,
+      };
+
+      if (localParticipant) {
+        const payload = new TextEncoder().encode(JSON.stringify(traceMessage));
+        localParticipant.publishData(payload, { reliable: true })
+          .catch((err) => {
+            console.error('Failed to send mic-off marker', err);
+          });
+      }
+
+      if (room) {
+        void (async () => {
+          const sample = await collectWebRtcNetSample(room);
+          if (sample && currentTraceIdRef.current === traceId) {
+            traceNetStartRef.current = { trace_id: traceId, sample };
+          }
+        })();
+      }
+
       localParticipant?.setMicrophoneEnabled(false);
     } else {
       localParticipant?.setMicrophoneEnabled(true);
     }
-  }, [isMicrophoneEnabled, localParticipant]);
+  }, [isMicrophoneEnabled, localParticipant, room]);
 
   const statusLabel = useMemo(() => {
     if (!isConnected && !isConnecting) return 'Press Connect to join the room';
@@ -366,16 +499,14 @@ function App() {
     try {
       setIsFetching(true);
       setError(null);
-      console.log('[Frontend] Fetching token from http://localhost:8006/getToken...');
       const response = await fetch('http://localhost:8006/getToken?roomName=voice-room&participantName=user');
       if (!response.ok) {
         throw new Error('Failed to fetch token from backend');
       }
       const data = await response.json();
-      console.log('[Frontend] Token received! URL:', data.url);
       setConnectionDetails(data);
     } catch (err: any) {
-      console.error('[Frontend] Token fetch error:', err.message);
+      console.error('Token fetch error:', err.message);
       setError(err.message);
     } finally {
       setIsFetching(false);

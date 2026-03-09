@@ -1,14 +1,27 @@
 import { useState, useRef, useCallback } from 'react';
 import { encodeWAV } from '../utils/wavEncoder';
 
+/** Convert a Float32Array audio chunk to Int16 PCM ArrayBuffer */
+function float32ToInt16(float32: Float32Array): ArrayBuffer {
+  const buf = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buf;
+}
+
 interface UseAudioProps {
   onSilence: (data: ArrayBuffer) => void;
+  onChunk?: (pcm16: ArrayBuffer) => void;  // stream each PCM-16 chunk in real time
   silenceThreshold?: number; // ms of silence before auto-stop
   volumeThreshold?: number;  // RMS level to consider as "speech"
 }
 
 export function useAudio({
   onSilence,
+  onChunk,
   silenceThreshold = 4000,
   volumeThreshold = 0.005,
 }: UseAudioProps) {
@@ -31,6 +44,9 @@ export function useAudio({
   const onSilenceRef = useRef(onSilence);
   onSilenceRef.current = onSilence;
 
+  const onChunkRef = useRef(onChunk);
+  onChunkRef.current = onChunk;
+
   const clearSilenceTimer = useCallback(() => {
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
@@ -46,6 +62,15 @@ export function useAudio({
 
   const flushAudio = useCallback(() => {
     if (chunksRef.current.length === 0) return;
+
+    // Don't trigger the pipeline if the user never actually spoke.
+    // For the Realtime path this prevents a spurious stream_end that would
+    // leave the UI stuck in "Thinking…" with no VAD response coming back.
+    if (!hasSpeechRef.current) {
+      chunksRef.current = [];
+      clearSilenceTimer();
+      return;
+    }
 
     const chunks = chunksRef.current;
     chunksRef.current = [];
@@ -120,12 +145,12 @@ export function useAudio({
           noiseSuppression: false,
           autoGainControl: false,
           channelCount: 1,
-          sampleRate: 16000,
+          sampleRate: 24000, // OpenAI Realtime API requires 24kHz PCM16
         },
       });
       streamRef.current = stream;
 
-      const audioContext = new AudioContext({ sampleRate: 16000 });
+      const audioContext = new AudioContext({ sampleRate: 24000 }); // must match Realtime API
       audioContextRef.current = audioContext;
 
       const source = audioContext.createMediaStreamSource(stream);
@@ -154,7 +179,13 @@ export function useAudio({
         if (!isRecordingRef.current) return;
 
         const inputData = e.inputBuffer.getChannelData(0);
-        chunksRef.current.push(new Float32Array(inputData));
+        const chunkCopy = new Float32Array(inputData);
+        chunksRef.current.push(chunkCopy);
+
+        // Stream chunk to server in real time as Int16 PCM
+        if (onChunkRef.current) {
+          onChunkRef.current(float32ToInt16(chunkCopy));
+        }
 
         let sum = 0;
         for (let i = 0; i < inputData.length; i++) {

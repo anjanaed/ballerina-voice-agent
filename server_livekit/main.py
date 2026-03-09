@@ -3,8 +3,11 @@ import os
 import io
 import wave
 import json
+import time
+import uuid
+from collections import defaultdict, deque
 from dotenv import load_dotenv
-
+from livekit import api
 from livekit import rtc
 from websockets.asyncio.client import connect as ws_connect
 
@@ -17,10 +20,10 @@ NUM_CHANNELS = 1
 BALLERINA_WS_URL = "ws://localhost:8002/ws"
 TTS_FRAME_MS = 20
 
-def create_wav_buffer(pcm_data: bytes, sample_rate: int) -> io.BytesIO:
+def create_wav_buffer(pcm_data: bytes, sample_rate: int, num_channels: int) -> io.BytesIO:
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wav_file:
-        wav_file.setnchannels(NUM_CHANNELS)
+        wav_file.setnchannels(num_channels)
         wav_file.setsampwidth(2) # 16 bits
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm_data)
@@ -31,6 +34,56 @@ def create_wav_buffer(pcm_data: bytes, sample_rate: int) -> io.BytesIO:
 audio_source: rtc.AudioSource | None = None
 tts_track_published = False
 tts_lock = asyncio.Lock()
+bal_ws: any = None
+bal_ws_lock = asyncio.Lock()
+bal_pipeline_lock = asyncio.Lock()
+pending_trace_markers: defaultdict[str, deque[dict]] = defaultdict(deque)
+pending_trace_markers_any: deque[dict] = deque()
+
+async def get_bal_ws():
+    """Returns a persistent WebSocket connection to the Ballerina server."""
+    global bal_ws
+    async with bal_ws_lock:
+        if bal_ws is None:
+            print(f"Connecting to Ballerina WebSocket at {BALLERINA_WS_URL}...")
+            bal_ws = await ws_connect(BALLERINA_WS_URL, max_size=10 * 1024 * 1024)
+            print(f"Connected to Ballerina WebSocket!")
+        return bal_ws
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+async def pop_trace_marker(participant_identity: str, timeout_ms: int = 1200) -> dict | None:
+    deadline = now_ms() + timeout_ms
+
+    while now_ms() <= deadline:
+        queue = pending_trace_markers[participant_identity]
+        while queue and now_ms() - int(queue[0].get("client_mic_off_ms") or 0) > 30_000:
+            queue.popleft()
+
+        if queue:
+            return queue.popleft()
+
+        await asyncio.sleep(0.02)
+
+    return None
+
+
+async def pop_any_trace_marker(timeout_ms: int = 1200) -> dict | None:
+    deadline = now_ms() + timeout_ms
+
+    while now_ms() <= deadline:
+        while pending_trace_markers_any and now_ms() - int(pending_trace_markers_any[0].get("client_mic_off_ms") or 0) > 30_000:
+            pending_trace_markers_any.popleft()
+
+        if pending_trace_markers_any:
+            return pending_trace_markers_any.popleft()
+
+        await asyncio.sleep(0.02)
+
+    return None
 
 
 async def ensure_tts_track_published(room: rtc.Room):
@@ -40,38 +93,22 @@ async def ensure_tts_track_published(room: rtc.Room):
     if audio_source is None:
         raise RuntimeError("Audio source not initialized")
 
-    print("Publishing TTS audio track...")
     track = rtc.LocalAudioTrack.create_audio_track("assistant-voice", audio_source)
     options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
     await room.local_participant.publish_track(track, options)
     tts_track_published = True
-    print("TTS track published")
 
 
-async def publish_text_event(room: rtc.Room, message_type: str, text: str):
-    payload = json.dumps({"type": message_type, "text": text}).encode('utf-8')
-    print(f"[Backend] Publishing data event: type={message_type}, text='{text}', payload_size={len(payload)} bytes")
+async def publish_text_event(room: rtc.Room, message_type: str, text: str, trace: dict | None = None):
+    payload = json.dumps({"type": message_type, "text": text, "trace": trace or {}}).encode('utf-8')
     await room.local_participant.publish_data(payload, reliable=True, topic="voice-text")
-    print(f"[Backend] Data published successfully")
-
-def request_audio_subscriptions(room: rtc.Room):
-    for identity, participant in room.remote_participants.items():
-        for publication in participant.track_publications.values():
-            if publication.kind != rtc.TrackKind.KIND_AUDIO:
-                continue
-            if not publication.subscribed:
-                publication.set_subscribed(True)
-                print(
-                    f"[Backend] Subscription re-requested: participant={identity} sid={publication.sid}",
-                    flush=True,
-                )
 
 
-async def stream_wav_to_livekit(wav_bytes: bytes):
+async def stream_wav_to_livekit(wav_bytes: bytes) -> int | None:
     """Decode a WAV buffer from Kokoro and push PCM frames into the LiveKit AudioSource."""
     global audio_source
     if audio_source is None:
-        return
+        return None
 
     wav_io = io.BytesIO(wav_bytes)
     with wave.open(wav_io, 'rb') as wf:
@@ -82,11 +119,14 @@ async def stream_wav_to_livekit(wav_bytes: bytes):
     frame_samples = (rate * TTS_FRAME_MS) // 1000
     frame_bytes_size = frame_samples * channels * 2
     pending = bytearray(pcm)
+    first_frame_out_ms: int | None = None
 
     async with tts_lock:
         while len(pending) >= frame_bytes_size:
             chunk = bytes(pending[:frame_bytes_size])
             del pending[:frame_bytes_size]
+            if first_frame_out_ms is None:
+                first_frame_out_ms = now_ms()
             await audio_source.capture_frame(
                 rtc.AudioFrame(chunk, rate, channels, frame_samples)
             )
@@ -95,39 +135,124 @@ async def stream_wav_to_livekit(wav_bytes: bytes):
                 pending.append(0)
             spc = len(pending) // (2 * channels)
             if spc > 0:
+                if first_frame_out_ms is None:
+                    first_frame_out_ms = now_ms()
                 await audio_source.capture_frame(
                     rtc.AudioFrame(bytes(pending), rate, channels, spc)
                 )
 
+    return first_frame_out_ms
 
-async def process_speech(audio_data: bytes, room: rtc.Room):
+
+def build_latency_metrics(trace: dict, marks: dict[str, int]) -> dict[str, int]:
+    metrics: dict[str, int] = {}
+
+    def put(name: str, start: int | None, end: int | None):
+        if start is not None and end is not None and end >= start:
+            metrics[name] = end - start
+
+    # All metrics below use the same Python-side clock (now_ms), so they are accurate.
+    put("python_to_ballerina_ms", trace.get("py_send_bal_ms"), marks.get("BAL_RECV"))
+    put("stt_ms", marks.get("STT_START"), marks.get("STT_END"))
+    put("llm_ms", marks.get("LLM_START"), marks.get("LLM_END"))
+    put("tts_ms", marks.get("TTS_START"), marks.get("TTS_END"))
+    put("ballerina_to_python_ms", marks.get("AUDIO_SEND"), trace.get("py_recv_audio_ms"))
+
+    return metrics
+
+
+def format_trace_seconds(trace: dict) -> dict:
+    formatted: dict = {
+        "trace_id": trace.get("trace_id"),
+        "frontend_marker_received": trace.get("frontend_marker_received", False),
+    }
+
+    duration_keys = (
+        "python_to_ballerina_ms",
+        "stt_ms",
+        "llm_ms",
+        "tts_ms",
+        "ballerina_to_python_ms",
+    )
+
+    for key in duration_keys:
+        value = trace.get(key)
+        if isinstance(value, (int, float)):
+            formatted[f"{key[:-3]}_s"] = round(value / 1000, 5)
+
+    # Always use the Python-side capture start as the baseline for offsets.
+    # Using client_mic_off_ms would be a cross-clock subtraction (browser vs server)
+    # which is unreliable without tight NTP sync.
+    base_ts = trace.get("py_capture_start_ms")
+
+    if isinstance(base_ts, (int, float)):
+        relative_points = {
+            "py_capture_start_ms": "py_capture_start_offset_s",
+            "py_send_bal_ms": "py_send_bal_offset_s",
+            "py_recv_audio_ms": "py_recv_audio_offset_s",
+            "py_first_tts_frame_out_ms": "py_first_tts_frame_out_offset_s",
+        }
+        for key, out_key in relative_points.items():
+            value = trace.get(key)
+            if isinstance(value, (int, float)):
+                formatted[out_key] = round((value - base_ts) / 1000, 5)
+
+    return formatted
+
+
+async def process_speech(
+    audio_data: bytes,
+    room: rtc.Room,
+    trace_context: dict | None = None,
+    sample_rate: int = SAMPLE_RATE,
+    num_channels: int = NUM_CHANNELS,
+):
     """Send audio to Ballerina over WebSocket and handle the STT/LLM/TTS pipeline."""
-    print("Processing speech chunk...")
-    wav_bytes = create_wav_buffer(audio_data, SAMPLE_RATE).read()
+    wav_bytes = create_wav_buffer(audio_data, sample_rate, num_channels).read()
+    trace = dict(trace_context or {})
+    trace.setdefault("trace_id", f"trace_py_{now_ms()}_{uuid.uuid4().hex[:8]}")
+    trace["frontend_marker_received"] = trace.get("client_mic_off_ms") is not None
 
     try:
-        async with ws_connect(BALLERINA_WS_URL, max_size=10 * 1024 * 1024) as ws:
+        async with bal_pipeline_lock:
+            ws = await get_bal_ws()
+            trace["py_send_bal_ms"] = now_ms()
             await ws.send(wav_bytes)
-            print("Sent audio to Ballerina, waiting for response...")
 
             tts_wav: bytes | None = None
+            stage_marks: dict[str, int] = {}
 
-            async for msg in ws:
+            while True:
+                try:
+                    msg = await ws.recv()
+                except Exception as e:
+                    print(f"WebSocket receive error: {e}")
+                    async with bal_ws_lock:
+                        global bal_ws
+                        bal_ws = None
+                    break
+
                 if isinstance(msg, bytes):
                     tts_wav = msg
+                    trace["py_recv_audio_ms"] = now_ms()
                     print(f"Received TTS audio: {len(tts_wav)} bytes")
 
                 elif isinstance(msg, str):
+                    if msg.startswith("MARK:"):
+                        mark = msg[len("MARK:"):].strip()
+                        stage_marks[mark] = now_ms()
+                        continue
+
                     if msg.startswith("TRANSCRIPT:"):
                         text = msg[len("TRANSCRIPT:"):]
-                        print(f"STT Output: {text}")
-                        await publish_text_event(room, "stt", text)
+                        await publish_text_event(room, "stt", text, trace)
 
                     elif msg.startswith("RESPONSE:"):
                         llm_text = msg[len("RESPONSE:"):]
-                        print(f"LLM Output: {llm_text}")
-                        await publish_text_event(room, "assistant", llm_text)
-                        break
+                        metrics = build_latency_metrics(trace, stage_marks)
+                        trace.update(metrics)
+                        await publish_text_event(room, "assistant", llm_text, trace)
+                        break # Finished processing this utterance
 
                     elif msg.startswith("ERROR:"):
                         print(f"Ballerina error: {msg}")
@@ -135,98 +260,182 @@ async def process_speech(audio_data: bytes, room: rtc.Room):
 
         if tts_wav:
             await ensure_tts_track_published(room)
-            print("Streaming TTS to Room...")
-            await stream_wav_to_livekit(tts_wav)
-            print("Done streaming TTS.")
+            first_out = await stream_wav_to_livekit(tts_wav)
+            if first_out is not None:
+                trace["py_first_tts_frame_out_ms"] = first_out
+            metrics = build_latency_metrics(trace, stage_marks)
+            trace.update(metrics)
+            print(f"[TRACE_RESULT] {json.dumps(format_trace_seconds(trace))}")
 
     except Exception as e:
         print(f"Error in pipeline: {e}")
         import traceback
         traceback.print_exc()
 
-async def handle_audio_stream(track: rtc.Track, room: rtc.Room):
+class AudioProcessor:
+    def __init__(self, room: rtc.Room, participant_identity: str):
+        self.room = room
+        self.participant_identity = participant_identity
+        self.buffer = bytearray()
+        self.capture_start_ms: int | None = None
+        self.min_chunk_seconds = 0.5
+        self.sample_rate = SAMPLE_RATE
+        self.num_channels = NUM_CHANNELS
+
+    def add_frame(self, frame: rtc.AudioFrame):
+        if self.capture_start_ms is None:
+            self.capture_start_ms = now_ms()
+        frame_rate = getattr(frame, "sample_rate", None)
+        frame_channels = getattr(frame, "num_channels", None)
+        if isinstance(frame_rate, int) and frame_rate > 0:
+            self.sample_rate = frame_rate
+        if isinstance(frame_channels, int) and frame_channels > 0:
+            self.num_channels = frame_channels
+        self.buffer.extend(bytes(frame.data))
+
+    async def flush(self, mute_detected_ms: int):
+        if not self.buffer:
+            return
+        
+        buffered_seconds = len(self.buffer) / (2 * self.num_channels * self.sample_rate)
+        
+        if buffered_seconds >= self.min_chunk_seconds:
+            audio_to_process = bytes(self.buffer)
+            marker = await pop_trace_marker(self.participant_identity)
+            if marker is None:
+                marker = await pop_any_trace_marker(200)
+
+            trace_context = {
+                "trace_id": marker.get("trace_id") if marker else f"trace_py_{now_ms()}_{uuid.uuid4().hex[:8]}",
+                "client_mic_off_ms": marker.get("client_mic_off_ms") if marker else None,
+                "py_marker_received_ms": marker.get("py_marker_received_ms") if marker else None,
+                "py_capture_start_ms": self.capture_start_ms,
+                "py_mute_detected_ms": mute_detected_ms,
+            }
+            asyncio.create_task(
+                process_speech(
+                    audio_to_process,
+                    self.room,
+                    trace_context,
+                    sample_rate=self.sample_rate,
+                    num_channels=self.num_channels,
+                )
+            )
+        
+        self.buffer.clear()
+        self.capture_start_ms = None
+
+audio_processors: dict[str, AudioProcessor] = {}
+
+async def handle_audio_stream(track: rtc.Track, room: rtc.Room, participant_identity: str):
+    processor = AudioProcessor(room, participant_identity)
+    audio_processors[track.sid] = processor
+    
     audio_stream = rtc.AudioStream(track)
-    buffer = bytearray()
-    min_chunk_seconds = 0.5
-    was_muted = track.muted
-    
-    print("Started listening to audio stream...")
-    
     async for event in audio_stream:
-        audio_frame = event.frame
+        if not track.muted:
+            processor.add_frame(event.frame)
             
-        global SAMPLE_RATE
-        SAMPLE_RATE = audio_frame.sample_rate
-
-        is_muted = track.muted
-
-        if was_muted and not is_muted:
-            print("Track unmuted, starting new capture segment...")
-            buffer.clear()
-
-        if not is_muted:
-            pcm_data = bytes(audio_frame.data)
-            buffer.extend(pcm_data)
-
-        if not was_muted and is_muted:
-            buffered_seconds = len(buffer) / (2 * NUM_CHANNELS * SAMPLE_RATE)
-            if buffered_seconds >= min_chunk_seconds:
-                print("Track muted, sending captured segment to pipeline...")
-                audio_to_process = bytes(buffer)
-                asyncio.create_task(process_speech(audio_to_process, room))
-            else:
-                print("[Backend] Segment too short, skipping STT")
-            buffer.clear()
-
-        was_muted = is_muted
-
-    if len(buffer) > 0:
-        buffered_seconds = len(buffer) / (2 * NUM_CHANNELS * SAMPLE_RATE)
-        if not track.muted and buffered_seconds >= min_chunk_seconds:
-            print("[Backend] Stream ended, flushing remaining buffered audio...")
-            asyncio.create_task(process_speech(bytes(buffer), room))
+    # Cleanup when stream ends
+    if track.sid in audio_processors:
+        del audio_processors[track.sid]
 
 
 def register_room_handlers(room: rtc.Room):
     @room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-        print(f"[Backend] Track subscribed: {participant.identity} - {track.kind}")
         if track.kind == rtc.TrackKind.KIND_AUDIO:
-            asyncio.create_task(handle_audio_stream(track, room))
+            asyncio.create_task(handle_audio_stream(track, room, participant.identity))
 
-    @room.on("participant_connected")
-    def on_participant_connected(participant: rtc.RemoteParticipant):
-        print(f"[Backend] Participant connected: {participant.identity}")
-        request_audio_subscriptions(room)
+    @room.on("track_muted")
+    def on_track_muted(participant: rtc.RemoteParticipant, publication: rtc.RemoteTrackPublication):
+        if publication.sid in audio_processors:
+            asyncio.create_task(audio_processors[publication.sid].flush(now_ms()))
 
-    @room.on("participant_disconnected")
-    def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        print(f"[Backend] Participant disconnected: {participant.identity}")
+    @room.on("track_unmuted")
+    def on_track_unmuted(participant: rtc.RemoteParticipant, publication: rtc.RemoteTrackPublication):
+        if publication.sid in audio_processors:
+            # Clear buffer and start fresh for new utterance
+            audio_processors[publication.sid].buffer.clear()
+            audio_processors[publication.sid].capture_start_ms = None
 
-    @room.on("track_published")
-    def on_track_published(publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-        if publication.kind == rtc.TrackKind.KIND_AUDIO:
-            print(f"[Backend] Audio track published by '{participant.identity}' (subscribed={publication.subscribed}, muted={publication.muted})")
-            publication.set_subscribed(True)
-            print(f"[Backend] Subscription requested on track_published sid={publication.sid}")
+    @room.on("data_received")
+    def on_data_received(*args):
+        payload: bytes | None = None
+        participant: rtc.RemoteParticipant | None = None
+        topic: str | None = None
+
+        for arg in args:
+            if isinstance(arg, (bytes, bytearray)) and payload is None:
+                payload = bytes(arg)
+            elif isinstance(arg, str) and topic is None:
+                topic = arg
+            elif isinstance(arg, rtc.RemoteParticipant) and participant is None:
+                participant = arg
+            elif hasattr(arg, "payload") and payload is None:
+                candidate = getattr(arg, "payload", None)
+                if isinstance(candidate, (bytes, bytearray)):
+                    payload = bytes(candidate)
+                topic_candidate = getattr(arg, "topic", None)
+                if isinstance(topic_candidate, str):
+                    topic = topic_candidate
+                participant_candidate = getattr(arg, "participant", None)
+                if isinstance(participant_candidate, rtc.RemoteParticipant):
+                    participant = participant_candidate
+            elif hasattr(arg, "data") and payload is None:
+                candidate = getattr(arg, "data", None)
+                if isinstance(candidate, (bytes, bytearray)):
+                    payload = bytes(candidate)
+                topic_candidate = getattr(arg, "topic", None)
+                if isinstance(topic_candidate, str):
+                    topic = topic_candidate
+                participant_candidate = getattr(arg, "participant", None)
+                if isinstance(participant_candidate, rtc.RemoteParticipant):
+                    participant = participant_candidate
+
+        if payload is None:
+            return
+
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return
+
+        if decoded.get("type") != "trace_marker":
+            return
+
+        if topic is not None and topic not in ("voice-trace", ""):
+            return
+
+        # Immediately echo trace_ack so client can measure DataChannel RTT
+        ack_payload = json.dumps({
+            "type": "trace_ack",
+            "trace_id": decoded.get("trace_id"),
+        }).encode("utf-8")
+        asyncio.create_task(
+            room.local_participant.publish_data(ack_payload, reliable=True, topic="voice-trace")
+        )
+
+        marker = {
+            "trace_id": decoded.get("trace_id"),
+            "client_mic_off_ms": decoded.get("client_mic_off_ms"),
+            "py_marker_received_ms": now_ms(),
+        }
+
+        pending_trace_markers_any.append(marker)
+
+        if participant is None:
+            if room.remote_participants:
+                participant = next(iter(room.remote_participants.values()))
+            else:
+                return
+
+        pending_trace_markers[participant.identity].append(marker)
 
     @room.on("track_subscription_failed")
     def on_track_subscription_failed(participant: rtc.RemoteParticipant, track_sid: str, error: str):
-        print(f"[Backend] Track subscription failed: participant={participant.identity}, sid={track_sid}, error={error}")
+        print(f"Track subscription failed: participant={participant.identity}, sid={track_sid}, error={error}")
 
-    @room.on("track_muted")
-    def on_track_muted(participant: rtc.Participant, publication: rtc.TrackPublication):
-        print(f"[Backend] Track muted: participant={participant.identity}, sid={publication.sid}")
-
-    @room.on("track_unmuted")
-    def on_track_unmuted(participant: rtc.Participant, publication: rtc.TrackPublication):
-        print(f"[Backend] Track unmuted: participant={participant.identity}, sid={publication.sid}")
-
-    @room.on("connection_state_changed")
-    def on_connection_state_changed(state: rtc.ConnectionState):
-        print(f"[Backend] Connection state changed: {state}")
-        if state == rtc.ConnectionState.CONN_CONNECTED:
-            request_audio_subscriptions(room)
 
 async def main():
     global audio_source
@@ -238,11 +447,9 @@ async def main():
     audio_source = rtc.AudioSource(24000, 1) # OpenAI TTS max freq is 24kHz
     register_room_handlers(room)
 
-    print(f"[Backend] Initializing agent...")
-    print(f"[Backend] LiveKit URL: {url}")
+    print("Starting LiveKit Python agent...")
 
     # Generate token for the agent
-    from livekit import api
     token = api.AccessToken(api_key, api_secret) \
         .with_identity("python-agent") \
         .with_name("python-agent") \
@@ -255,42 +462,15 @@ async def main():
         )) \
         .to_jwt()
     
-    print(f"[Backend] Token generated with subscribe permissions", flush=True)
-
-    print(f"[Backend] Connecting to room at {url}...")
+    print(f"Connecting to room at {url}...")
     
     try:
-        # Use default auto-subscribe behavior
         await room.connect(url, token)
-        print(f"[Backend] Connected to room: {room.name}", flush=True)
+        print(f"Connected to room: {room.name}", flush=True)
         await ensure_tts_track_published(room)
-        
-        # Wait a moment for room state to sync
-        await asyncio.sleep(1)
-        
-        # Check for participants
-        print(f"[Backend] Checking for participants... Found: {len(room.remote_participants)}", flush=True)
-        
-        # Subscribe to all existing participants' tracks
-        for identity, participant in room.remote_participants.items():
-            print(f"[Backend] Found participant: {identity} with {len(participant.track_publications)} tracks", flush=True)
-            for publication in participant.track_publications.values():
-                if publication.kind == rtc.TrackKind.KIND_AUDIO:
-                    print(
-                        f"[Backend] Existing audio publication: sid={publication.sid}, "
-                        f"subscribed={publication.subscribed}, muted={publication.muted}",
-                        flush=True,
-                    )
-                    if not publication.subscribed:
-                        publication.set_subscribed(True)
-                        print(
-                            f"[Backend] Subscription requested for existing track sid={publication.sid}",
-                            flush=True,
-                        )
-        
-        print("[Backend] Ready", flush=True)
+        print("Python agent ready", flush=True)
     except Exception as e:
-        print(f"[Backend] ERROR during connection: {e}", flush=True)
+        print(f"ERROR during connection: {e}", flush=True)
         import traceback
         traceback.print_exc()
         return
@@ -299,7 +479,7 @@ async def main():
         while room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("[Backend] Shutting down...")
+        print("Shutting down...")
     finally:
         await room.disconnect()
 

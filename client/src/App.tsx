@@ -9,18 +9,26 @@ import './App.css';
 const WAVE_DURATIONS = Array.from({ length: 12 }, () => 0.5 + Math.random() * 0.55);
 
 function App() {
-  const [selectedPort] = useState(() => localStorage.getItem('selectedPort') || '8002');
+  const [selectedPort] = useState(() => localStorage.getItem('selectedPort') || '8010');
 
-  const { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage } =
+  const { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage: _sendMessage, streamChunk, endStream } =
     useWebSocket(`ws://localhost:${selectedPort}/ws`);
 
+  // Called when silence timeout fires — signal end of streaming speech
   const handleSilence = useCallback(
-    (data: ArrayBuffer) => { sendMessage(data); },
-    [sendMessage]
+    (_data: ArrayBuffer) => { endStream(); },
+    [endStream]
+  );
+
+  // Stream each PCM chunk to the server in real time
+  const handleChunk = useCallback(
+    (pcm16: ArrayBuffer) => { streamChunk(pcm16); },
+    [streamChunk]
   );
 
   const { isRecording, volume, silenceSecondsLeft, startRecording, stopRecording } = useAudio({
     onSilence: handleSilence,
+    onChunk: handleChunk,
     silenceThreshold: 2000,
   });
 

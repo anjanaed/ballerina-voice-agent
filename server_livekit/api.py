@@ -24,8 +24,9 @@ async def handle_token(request):
         .with_grants(VideoGrants(
             room_join=True, 
             room=room_name,
-            can_publish=True,     # Allow publishing tracks
-               # Automatically subscribe to tracks when joining
+            can_publish=True,
+            can_subscribe=True,
+            can_publish_data=True,
         ))
 
     print(f"[TokenServer] Generated token for {participant_name} with pub/sub permissions")

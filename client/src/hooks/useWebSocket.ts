@@ -10,10 +10,13 @@ export function useWebSocket(url: string) {
   const [isConnecting, setIsConnecting] = useState(true);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([]);  // Full conversation history
+  const [messages, setMessages] = useState<Message[]>([]);  
   const socketRef = useRef<WebSocket | null>(null);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const pendingBlobUrlRef = useRef<string | null>(null);
+  const currentTraceIdRef = useRef<string | null>(null);
+  const wsPingSentRef = useRef<Map<string, number>>(new Map());
+  const wsRttMsRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -67,14 +70,62 @@ export function useWebSocket(url: string) {
         } else if (typeof event.data === 'string') {
           const msg = event.data as string;
 
+          if (msg.startsWith('PONG:')) {
+            const tid = msg.slice('PONG:'.length).trim();
+            const sentAt = wsPingSentRef.current.get(tid);
+            if (sentAt !== undefined) {
+              wsRttMsRef.current.set(tid, Date.now() - sentAt);
+              wsPingSentRef.current.delete(tid);
+            }
+            return;
+          }
+
+          if (msg.startsWith('MARK:')) {
+            // MARK:RESPONSE_DONE signals the model finished — clear processing state
+            // for responses that have no audio output (e.g. pure function-call turns).
+            if (msg === 'MARK:RESPONSE_DONE' || msg === 'MARK:RESPONSE_CANCELLED') {
+              setIsProcessing(false);
+            }
+            return;
+          }
+
+          if (msg.startsWith('TRACE_RESULT:')) {
+            const payload = msg.slice('TRACE_RESULT:'.length).trim();
+            try {
+              const parsed = JSON.parse(payload);
+              const tid = parsed.trace_id;
+              const wsRttMs = tid ? wsRttMsRef.current.get(tid) : undefined;
+              console.log('[TRACE_RESULT]', {
+                ...parsed,
+                ...(wsRttMs !== undefined ? {
+                  ws_rtt_ms: wsRttMs,
+                  frontend_to_backend_ws_ms: Math.round(wsRttMs / 2),
+                } : {}),
+              });
+              if (tid) wsRttMsRef.current.delete(tid);
+            } catch {
+              console.log('[TRACE_RESULT]', payload);
+            }
+            return;
+          }
+
           if (msg.startsWith('TRANSCRIPT:')) {
-            // Received transcription of user speech
+            // Completed transcription of user speech (from Whisper or Realtime API)
             const text = msg.slice('TRANSCRIPT:'.length).trim();
             setMessages((prev) => [...prev, { role: 'user', text }]);
 
+          } else if (msg.startsWith('TRANSCRIPT_DELTA:')) {
+            // Streaming transcript delta from Realtime API — ignored here,
+            // full transcript arrives via TRANSCRIPT: when complete.
+
           } else if (msg.startsWith('RESPONSE:')) {
-            // Received assistant text response
+            // Legacy server_local text response
             const text = msg.slice('RESPONSE:'.length).trim();
+            setMessages((prev) => [...prev, { role: 'assistant', text }]);
+
+          } else if (msg.startsWith('AGENT_RESPONSE:')) {
+            // Ballerina agent invocation result (Realtime server invoke_agent tool)
+            const text = msg.slice('AGENT_RESPONSE:'.length).trim();
             setMessages((prev) => [...prev, { role: 'assistant', text }]);
 
           } else if (msg.startsWith('ERROR:')) {
@@ -111,7 +162,8 @@ export function useWebSocket(url: string) {
       URL.revokeObjectURL(pendingBlobUrlRef.current);
     }
 
-    const blob = new Blob([data], { type: 'audio/mpeg' });
+    // Server sends WAV-wrapped PCM16 audio from the Realtime API
+    const blob = new Blob([data], { type: 'audio/wav' });
     const audioUrl = URL.createObjectURL(blob);
     pendingBlobUrlRef.current = audioUrl;
 
@@ -137,9 +189,55 @@ export function useWebSocket(url: string) {
     });
   };
 
+  // Stream a single PCM-16 chunk to the server during recording
+  const streamChunk = useCallback((pcm16: ArrayBuffer): void => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(pcm16);
+    }
+  }, []);
+
+  // Signal end of streaming speech — sends trace_marker + stream_end
+  const endStream = useCallback((): boolean => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      setIsProcessing(true);
+
+      const now = Date.now();
+      const traceId = `trace_${now}_${Math.random().toString(36).slice(2, 8)}`;
+      currentTraceIdRef.current = traceId;
+      wsPingSentRef.current.set(traceId, now);
+      const marker = {
+        type: 'trace_marker',
+        trace_id: traceId,
+        client_mic_off_ms: now,
+      };
+      socketRef.current.send(JSON.stringify(marker));
+
+      socketRef.current.send(JSON.stringify({ type: 'stream_end' }));
+      return true;
+    }
+    console.warn(
+      'WebSocket not open — stream_end dropped. readyState:',
+      socketRef.current?.readyState ?? 'no socket'
+    );
+    return false;
+  }, []);
+
+  // Legacy: send a complete WAV in one shot (non-streaming fallback)
   const sendMessage = useCallback((data: ArrayBuffer): boolean => {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       setIsProcessing(true);
+
+      const now = Date.now();
+      const traceId = `trace_${now}_${Math.random().toString(36).slice(2, 8)}`;
+      currentTraceIdRef.current = traceId;
+      wsPingSentRef.current.set(traceId, now);
+      const marker = {
+        type: 'trace_marker',
+        trace_id: traceId,
+        client_mic_off_ms: now,
+      };
+
+      socketRef.current.send(JSON.stringify(marker));
       socketRef.current.send(data);
       return true;
     }
@@ -150,5 +248,5 @@ export function useWebSocket(url: string) {
     return false;
   }, []);
 
-  return { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage };
+  return { isConnected, isConnecting, isProcessing, isSpeaking, messages, sendMessage, streamChunk, endStream };
 }

@@ -70,7 +70,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8005) -> None:
+def run_server(host: str = "0.0.0.0", port: int = 8005) -> None:
     server = HTTPServer((host, port), TTSHandler)
     print(f"TTS server running on http://{host}:{port}")
     print("POST JSON to /synthesize with: text, voice(optional), speed(optional)")

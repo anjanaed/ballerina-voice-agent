@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  client:
+    build:
+      context: ./client
+    ports:
+      - "5173:5173"
+
+  server-openai:
+    build:
+      context: ./server_OpenAI
+    ports:
+      - "8001:8001"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
+  server-local:
+    build:
+      context: ./server_local
+    ports:
+      - "8002:8002"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - WHISPER_URL=http://host.docker.internal:8000
+      - KOKORO_URL=http://host.docker.internal:8005

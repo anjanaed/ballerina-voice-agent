@@ -1,6 +1,8 @@
 import ballerina/http;
+import ballerina/os;
 
-final http:Client whisperClient = check new ("http://localhost:8000");
+final string whisperUrl = os:getEnv("WHISPER_URL") != "" ? os:getEnv("WHISPER_URL") : "http://localhost:8000";
+final http:Client whisperClient = check new (whisperUrl);
 
 public isolated function transcribeWithLocalWhisper(byte[] data) returns string|error {
     http:Response response = check whisperClient->post("/transcribe", data);

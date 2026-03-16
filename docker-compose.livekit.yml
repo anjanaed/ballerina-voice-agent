@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  client2:
+    build:
+      context: ./client_2
+    ports:
+      - "5174:5173"
+    environment:
+      - VITE_LIVEKIT_API_URL=http://localhost:8006
+
+  livekit-main:
+    build:
+      context: ./server_livekit
+    command: python main.py
+    environment:
+      - BALLERINA_WS_URL=ws://host.docker.internal:8002/ws
+    env_file:
+      - ./server_livekit/.env
+
+  livekit-api:
+    build:
+      context: ./server_livekit
+    command: python api.py
+    ports:
+      - "8006:8006"
+    env_file:
+      - ./server_livekit/.env

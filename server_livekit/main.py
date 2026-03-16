@@ -17,7 +17,7 @@ load_dotenv()
 SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
 
-BALLERINA_WS_URL = "ws://localhost:8002/ws"
+BALLERINA_WS_URL = os.getenv("BALLERINA_WS_URL", "ws://localhost:8002/ws")
 TTS_FRAME_MS = 20
 
 def create_wav_buffer(pcm_data: bytes, sample_rate: int, num_channels: int) -> io.BytesIO:

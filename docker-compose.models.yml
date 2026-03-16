@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  whisper-stt:
+    build:
+      context: ./models/whisper-STT
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/whisper:/root/.cache/whisper
+
+  kokoro-tts:
+    build:
+      context: ./models/kokoro-0.9.4-TTS
+    ports:
+      - "8005:8005"

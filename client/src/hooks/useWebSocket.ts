@@ -14,9 +14,6 @@ export function useWebSocket(url: string) {
   const socketRef = useRef<WebSocket | null>(null);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const pendingBlobUrlRef = useRef<string | null>(null);
-  const currentTraceIdRef = useRef<string | null>(null);
-  const wsPingSentRef = useRef<Map<string, number>>(new Map());
-  const wsRttMsRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -70,44 +67,7 @@ export function useWebSocket(url: string) {
         } else if (typeof event.data === 'string') {
           const msg = event.data as string;
 
-          if (msg.startsWith('PONG:')) {
-            const tid = msg.slice('PONG:'.length).trim();
-            const sentAt = wsPingSentRef.current.get(tid);
-            if (sentAt !== undefined) {
-              wsRttMsRef.current.set(tid, Date.now() - sentAt);
-              wsPingSentRef.current.delete(tid);
-            }
-            return;
-          }
 
-          if (msg.startsWith('MARK:')) {
-            // MARK:RESPONSE_DONE signals the model finished — clear processing state
-            // for responses that have no audio output (e.g. pure function-call turns).
-            if (msg === 'MARK:RESPONSE_DONE' || msg === 'MARK:RESPONSE_CANCELLED') {
-              setIsProcessing(false);
-            }
-            return;
-          }
-
-          if (msg.startsWith('TRACE_RESULT:')) {
-            const payload = msg.slice('TRACE_RESULT:'.length).trim();
-            try {
-              const parsed = JSON.parse(payload);
-              const tid = parsed.trace_id;
-              const wsRttMs = tid ? wsRttMsRef.current.get(tid) : undefined;
-              console.log('[TRACE_RESULT]', {
-                ...parsed,
-                ...(wsRttMs !== undefined ? {
-                  ws_rtt_ms: wsRttMs,
-                  frontend_to_backend_ws_ms: Math.round(wsRttMs / 2),
-                } : {}),
-              });
-              if (tid) wsRttMsRef.current.delete(tid);
-            } catch {
-              console.log('[TRACE_RESULT]', payload);
-            }
-            return;
-          }
 
           if (msg.startsWith('TRANSCRIPT:')) {
             // Completed transcription of user speech (from Whisper or Realtime API)
@@ -201,16 +161,7 @@ export function useWebSocket(url: string) {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       setIsProcessing(true);
 
-      const now = Date.now();
-      const traceId = `trace_${now}_${Math.random().toString(36).slice(2, 8)}`;
-      currentTraceIdRef.current = traceId;
-      wsPingSentRef.current.set(traceId, now);
-      const marker = {
-        type: 'trace_marker',
-        trace_id: traceId,
-        client_mic_off_ms: now,
-      };
-      socketRef.current.send(JSON.stringify(marker));
+      setIsProcessing(true);
 
       socketRef.current.send(JSON.stringify({ type: 'stream_end' }));
       return true;
@@ -227,17 +178,7 @@ export function useWebSocket(url: string) {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       setIsProcessing(true);
 
-      const now = Date.now();
-      const traceId = `trace_${now}_${Math.random().toString(36).slice(2, 8)}`;
-      currentTraceIdRef.current = traceId;
-      wsPingSentRef.current.set(traceId, now);
-      const marker = {
-        type: 'trace_marker',
-        trace_id: traceId,
-        client_mic_off_ms: now,
-      };
-
-      socketRef.current.send(JSON.stringify(marker));
+      setIsProcessing(true);
       socketRef.current.send(data);
       return true;
     }

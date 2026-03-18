@@ -76,9 +76,6 @@ service class WsService {
 
     # The unique session ID for the connection.
     private final string sessionId = uuid:createRandomUuid();
-    private string? pendingTraceId = ();
-    private decimal? pendingClientMicOffMs = ();
-    private decimal? pendingMarkerReceivedMs = ();
     # Accumulated streaming PCM-16 chunks (Int16 LE, mono, 16kHz)
     private byte[] streamBuffer = [];
     private boolean isStreaming = false;
@@ -91,23 +88,7 @@ service class WsService {
 
         if parsed is map<json> {
             json? msgType = parsed.get("type");
-            if msgType is string && msgType == "trace_marker" {
-                self.pendingMarkerReceivedMs = nowEpochMs();
-                json? traceId = parsed.get("trace_id");
-                if traceId is string {
-                    self.pendingTraceId = traceId;
-                    sendText(caller, string `PONG:${traceId}`);
-                }
-
-                json? clientMicOff = parsed.get("client_mic_off_ms");
-                if clientMicOff is int {
-                    self.pendingClientMicOffMs = <decimal>clientMicOff;
-                } else if clientMicOff is float {
-                    self.pendingClientMicOffMs = <decimal>clientMicOff;
-                } else if clientMicOff is decimal {
-                    self.pendingClientMicOffMs = clientMicOff;
-                }
-            } else if msgType is string && msgType == "stream_end" {
+            if msgType is string && msgType == "stream_end" {
                 // Streaming complete — wrap accumulated PCM into WAV and process
                 if self.streamBuffer.length() > 0 {
                     byte[] wavData = wrapPcmAsWav(self.streamBuffer, 16000);
@@ -139,29 +120,7 @@ service class WsService {
 
     # Runs the full STT → LLM → TTS pipeline on a complete WAV buffer.
     private function processAudioPipeline(websocket:Caller caller, byte[] data) {
-        decimal balRecvMs = nowEpochMs();
-        string traceId;
-        string? pendingTraceId = self.pendingTraceId;
-        if pendingTraceId is string {
-            traceId = pendingTraceId;
-        } else {
-            traceId = string `trace_${balRecvMs}_${uuid:createRandomUuid()}`;
-        }
-        decimal? clientMicOffMs = self.pendingClientMicOffMs;
-        decimal? markerRecvMs = self.pendingMarkerReceivedMs;
-        self.pendingTraceId = ();
-        self.pendingClientMicOffMs = ();
-        self.pendingMarkerReceivedMs = ();
-
-        sendText(caller, "MARK:BAL_RECV");
-
-        sendText(caller, "MARK:STT_START");
-        decimal sttStart = time:monotonicNow();
-
         string|error transcriptResult = whisper_client:transcribeWithLocalWhisper(data);
-        decimal sttSeconds = time:monotonicNow() - sttStart;
-
-        sendText(caller, "MARK:STT_END");
 
         if transcriptResult is error {
             io:println("STT error: ", transcriptResult.message());
@@ -173,13 +132,7 @@ service class WsService {
 
         sendText(caller, string `TRANSCRIPT:${transcript}`);
 
-        sendText(caller, "MARK:LLM_START");
-        decimal llmStart = time:monotonicNow();
-
         string|error agentResult = voiceAgent.run(transcript, self.sessionId);
-        decimal llmSeconds = time:monotonicNow() - llmStart;
-
-        sendText(caller, "MARK:LLM_END");
 
         if agentResult is error {
             io:println("Agent error: ", agentResult.message());
@@ -189,13 +142,7 @@ service class WsService {
 
         string llmResponse = agentResult;
 
-        sendText(caller, "MARK:TTS_START");
-        decimal ttsStart = time:monotonicNow();
-
         byte[]|error audioResult = kokoro_client:ttsWithKokoro(llmResponse);
-        decimal ttsSeconds = time:monotonicNow() - ttsStart;
-
-        sendText(caller, "MARK:TTS_END");
 
         if audioResult is error {
             io:println("TTS error: ", audioResult.message());
@@ -203,25 +150,11 @@ service class WsService {
             return;
         }
 
-        sendText(caller, "MARK:AUDIO_SEND");
-
         websocket:Error? audioErr = caller->writeMessage(audioResult);
         if audioErr is websocket:Error {
             io:println("Failed to send audio: ", audioErr.message());
         }
         sendText(caller, string `RESPONSE:${llmResponse}`);
-
-        map<json> traceResult = {
-            trace_id: traceId,
-            frontend_marker_received: clientMicOffMs is decimal,
-            bal_recv_ms: balRecvMs,
-            marker_recv_ms: markerRecvMs,
-            stt_s: sttSeconds,
-            llm_s: llmSeconds,
-            tts_s: ttsSeconds
-        };
-
-        sendText(caller, string `TRACE_RESULT:${value:toJsonString(traceResult)}`);
     }
 }
 
@@ -270,10 +203,6 @@ isolated function wrapPcmAsWav(byte[] pcmData, int sampleRate) returns byte[] {
     return header;
 }
 
-isolated function nowEpochMs() returns decimal {
-    time:Utc now = time:utcNow(3);
-    return <decimal>now[0] * 1000 + (now[1] * 1000);
-}
 
 # Sends a text message to the WebSocket caller.
 #

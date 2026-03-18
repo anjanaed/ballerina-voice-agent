@@ -38,8 +38,6 @@ service class WsService {
     *websocket:Service;
 
     private final string sessionId = uuid:createRandomUuid();
-    private string? pendingTraceId = ();
-    private decimal? pendingClientMicOffMs = ();
     # Accumulated streaming PCM-16 chunks (Int16 LE, mono, 16kHz)
     private byte[] streamBuffer = [];
     private boolean isStreaming = false;
@@ -52,22 +50,7 @@ service class WsService {
 
         if parsed is map<json> {
             json? msgType = parsed.get("type");
-            if msgType is string && msgType == "trace_marker" {
-                json? traceId = parsed.get("trace_id");
-                if traceId is string {
-                    self.pendingTraceId = traceId;
-                    sendText(caller, string `PONG:${traceId}`);
-                }
-
-                json? clientMicOff = parsed.get("client_mic_off_ms");
-                if clientMicOff is int {
-                    self.pendingClientMicOffMs = <decimal>clientMicOff;
-                } else if clientMicOff is float {
-                    self.pendingClientMicOffMs = <decimal>clientMicOff;
-                } else if clientMicOff is decimal {
-                    self.pendingClientMicOffMs = clientMicOff;
-                }
-            } else if msgType is string && msgType == "stream_end" {
+            if msgType is string && msgType == "stream_end" {
                 // Streaming complete — wrap accumulated PCM into WAV and process
                 if self.streamBuffer.length() > 0 {
                     byte[] wavData = wrapPcmAsWav(self.streamBuffer, 16000);
@@ -99,21 +82,7 @@ service class WsService {
 
     # Runs the full STT → LLM → TTS pipeline on a complete WAV/audio buffer.
     private function processAudioPipeline(websocket:Caller caller, byte[] data) {
-        decimal balRecvMs = nowEpochMs();
-        string traceId;
-        string? pendingTraceId = self.pendingTraceId;
-        if pendingTraceId is string {
-            traceId = pendingTraceId;
-        } else {
-            traceId = string `trace_${balRecvMs}_${uuid:createRandomUuid()}`;
-        }
-        decimal? clientMicOffMs = self.pendingClientMicOffMs;
-        self.pendingTraceId = ();
-        self.pendingClientMicOffMs = ();
-
-        decimal sttStart = time:monotonicNow();
         string|error transcriptResult = speechToText(data);
-        decimal sttSeconds = time:monotonicNow() - sttStart;
         if transcriptResult is error {
             io:println("STT error: ", transcriptResult.message());
             sendText(caller, string `ERROR: transcription failed — ${transcriptResult.message()}`);
@@ -123,9 +92,7 @@ service class WsService {
         string transcript = transcriptResult;
         sendText(caller, string `TRANSCRIPT:${transcript}`);
 
-        decimal llmStart = time:monotonicNow();
         string|error agentResult = voiceAgent.run(transcript, self.sessionId);
-        decimal llmSeconds = time:monotonicNow() - llmStart;
         if agentResult is error {
             io:println("Agent error: ", agentResult.message());
             sendText(caller, string `ERROR: Agent failed — ${agentResult.message()}`);
@@ -134,9 +101,7 @@ service class WsService {
 
         string llmResponse = agentResult;
 
-        decimal ttsStart = time:monotonicNow();
         byte[]|error audioResult = textToSpeech(llmResponse);
-        decimal ttsSeconds = time:monotonicNow() - ttsStart;
         if audioResult is error {
             io:println("TTS error: ", audioResult.message());
             sendText(caller, string `ERROR: TTS failed — ${audioResult.message()}`);
@@ -148,16 +113,6 @@ service class WsService {
             io:println("Failed to send audio to client: ", audioErr.message());
         }
         sendText(caller, string `RESPONSE:${llmResponse}`);
-
-        map<json> traceResult = {
-            trace_id: traceId,
-            frontend_marker_received: clientMicOffMs is decimal,
-            stt_s: sttSeconds,
-            llm_s: llmSeconds,
-            tts_s: ttsSeconds
-        };
-
-        sendText(caller, string `TRACE_RESULT:${value:toJsonString(traceResult)}`);
     }
 }
 
@@ -191,10 +146,6 @@ isolated function wrapPcmAsWav(byte[] pcmData, int sampleRate) returns byte[] {
     return header;
 }
 
-isolated function nowEpochMs() returns decimal {
-    time:Utc now = time:utcNow(3);
-    return <decimal>now[0] * 1000 + (now[1] * 1000);
-}
 
 # Sends a plain-text WebSocket frame.
 #

@@ -180,9 +180,7 @@ def format_trace_seconds(trace: dict) -> dict:
         if isinstance(value, (int, float)):
             formatted[f"{key[:-3]}_s"] = round(value / 1000, 5)
 
-    # Always use the Python-side capture start as the baseline for offsets.
     # Using client_mic_off_ms would be a cross-clock subtraction (browser vs server)
-    # which is unreliable without tight NTP sync.
     base_ts = trace.get("py_capture_start_ms")
 
     if isinstance(base_ts, (int, float)):

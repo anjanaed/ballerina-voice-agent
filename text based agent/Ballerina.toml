@@ -1,0 +1,9 @@
+[package]
+org = "Anjana_Ed"
+name = "Voice_Agent"
+version = "0.1.0"
+distribution = "2201.13.1"
+title = "oo"
+
+[build-options]
+sticky = true

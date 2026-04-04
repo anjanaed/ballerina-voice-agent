@@ -1,10 +1,8 @@
 import ballerina/ai;
 import ballerina/http;
 import ballerina/io;
-import ballerina/time;
 import ballerina/uuid;
 import ballerina/websocket;
-import ballerina/lang.value as value;
 import ballerinax/ai.openai;
 import ballerinax/openai.audio;
 
@@ -38,7 +36,8 @@ service class WsService {
     *websocket:Service;
 
     private final string sessionId = uuid:createRandomUuid();
-    # Accumulated streaming PCM-16 chunks (Int16 LE, mono, 16kHz)
+    private int streamSampleRate = 24000;
+    # Accumulated streaming PCM-16 chunks (Int16 LE, mono)
     private byte[] streamBuffer = [];
     private boolean isStreaming = false;
 
@@ -50,12 +49,32 @@ service class WsService {
 
         if parsed is map<json> {
             json? msgType = parsed.get("type");
+            if msgType is string && msgType == "stream_start" {
+                self.streamBuffer = [];
+                self.isStreaming = true;
+                json? sampleRateJson = parsed.get("sampleRate");
+                int? sampleRate = toSampleRate(sampleRateJson);
+                if sampleRate is int {
+                    self.streamSampleRate = sampleRate;
+                }
+            }
+
+            if msgType is string && msgType == "stream_cancel" {
+                self.streamBuffer = [];
+                self.isStreaming = false;
+                return;
+            }
+
             if msgType is string && msgType == "stream_end" {
                 // Streaming complete — wrap accumulated PCM into WAV and process
                 if self.streamBuffer.length() > 0 {
-                    byte[] wavData = wrapPcmAsWav(self.streamBuffer, 16000);
+                    byte[] pcm = normalizePcm16Buffer(self.streamBuffer);
                     self.streamBuffer = [];
                     self.isStreaming = false;
+                    if pcm.length() == 0 {
+                        return;
+                    }
+                    byte[] wavData = wrapPcmAsWav(pcm, self.streamSampleRate);
                     self.processAudioPipeline(caller, wavData);
                 } else {
                     self.isStreaming = false;
@@ -72,15 +91,24 @@ service class WsService {
         // Check if this looks like a WAV file (starts with RIFF header)
         if data.length() >= 44 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 {
             // Full WAV received (non-streaming / legacy path)
+            self.streamBuffer = [];
+            self.isStreaming = false;
             self.processAudioPipeline(caller, data);
         } else {
             // Streaming PCM-16 chunk — accumulate
+            if !self.isStreaming {
+                self.streamBuffer = [];
+                self.isStreaming = true;
+            }
             self.isStreaming = true;
             self.streamBuffer.push(...data);
         }
     }
 
-    # Runs the full STT → LLM → TTS pipeline on a complete WAV/audio buffer.
+    # Runs the full STT -> LLM -> TTS pipeline on a complete WAV/audio buffer.
+    #
+    # + caller - The WebSocket caller
+    # + data - Complete WAV/audio payload to process
     private function processAudioPipeline(websocket:Caller caller, byte[] data) {
         string|error transcriptResult = speechToText(data);
         if transcriptResult is error {
@@ -116,7 +144,51 @@ service class WsService {
     }
 }
 
+# Converts a json number/string to a valid sample rate in Hz.
+#
+# + sampleRateJson - Sample rate value from client metadata
+# + return - Valid sample rate in range [8000, 48000], or () if invalid
+isolated function toSampleRate(json? sampleRateJson) returns int? {
+    int? sampleRate = ();
+    if sampleRateJson is int {
+        sampleRate = sampleRateJson;
+    } else if sampleRateJson is float {
+        sampleRate = <int>sampleRateJson;
+    } else if sampleRateJson is decimal {
+        sampleRate = <int>sampleRateJson;
+    } else if sampleRateJson is string {
+        int|error parsed = int:fromString(sampleRateJson);
+        if parsed is int {
+            sampleRate = parsed;
+        }
+    }
+
+    if sampleRate is int && sampleRate >= 8000 && sampleRate <= 48000 {
+        return sampleRate;
+    }
+    return ();
+}
+
+# Ensures PCM-16 payload is aligned to whole samples.
+#
+# + pcmData - Raw PCM bytes
+# + return - PCM bytes trimmed to an even length
+isolated function normalizePcm16Buffer(byte[] pcmData) returns byte[] {
+    int len = pcmData.length();
+    if len < 2 {
+        return [];
+    }
+    if len % 2 == 0 {
+        return pcmData;
+    }
+    return pcmData[0...len - 2];
+}
+
 # Wraps raw PCM-16 (Int16 LE, mono) bytes into a valid WAV buffer.
+#
+# + pcmData - PCM byte payload
+# + sampleRate - Audio sample rate in Hz
+# + return - WAV bytes with a generated header
 isolated function wrapPcmAsWav(byte[] pcmData, int sampleRate) returns byte[] {
     int dataLen = pcmData.length();
     int fileLen = 36 + dataLen;
